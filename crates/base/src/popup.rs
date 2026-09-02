@@ -6,7 +6,7 @@ use gpui::{
     StyleRefinement, Styled, Window, deferred, div, px,
 };
 
-use crate::{ElementExt as _, Positioner, StyledExt as _};
+use crate::{Align, ElementExt as _, Placement, Positioner, StyledExt as _};
 
 /// Distance kept between a popup and the window edge.
 const WINDOW_MARGIN: Pixels = px(8.);
@@ -31,6 +31,11 @@ pub struct Popup {
     base: gpui::Stateful<Div>,
     style: StyleRefinement,
     anchor: Anchor,
+    placement: Option<Placement>,
+    align: Align,
+    offset: Pixels,
+    margin: Pixels,
+    priority: usize,
     trigger: AnyElement,
     content: Option<AnyElement>,
 }
@@ -43,6 +48,11 @@ impl Popup {
             id,
             style: StyleRefinement::default(),
             anchor: Anchor::TopLeft,
+            placement: None,
+            align: Align::Center,
+            offset: px(0.),
+            margin: WINDOW_MARGIN,
+            priority: POPUP_PRIORITY,
             trigger: trigger.into_any_element(),
             content: None,
         }
@@ -50,6 +60,38 @@ impl Popup {
 
     pub fn anchor(mut self, anchor: impl Into<Anchor>) -> Self {
         self.anchor = anchor.into();
+        self
+    }
+
+    /// Places the popup on a side of its trigger, with viewport-aware flipping.
+    ///
+    /// This takes precedence over [`Popup::anchor`].
+    pub fn placement(mut self, placement: Placement) -> Self {
+        self.placement = Some(placement);
+        self
+    }
+
+    /// Sets the popup alignment along its selected side.
+    pub fn align(mut self, align: Align) -> Self {
+        self.align = align;
+        self
+    }
+
+    /// Sets the gap between the trigger and a side-positioned popup.
+    pub fn offset(mut self, offset: Pixels) -> Self {
+        self.offset = offset;
+        self
+    }
+
+    /// Sets the minimum distance kept between the popup and the window edge.
+    pub fn margin(mut self, margin: Pixels) -> Self {
+        self.margin = margin;
+        self
+    }
+
+    /// Sets the deferred paint priority for the popup surface.
+    pub fn priority(mut self, priority: usize) -> Self {
+        self.priority = priority;
         self
     }
 
@@ -132,16 +174,31 @@ impl RenderOnce for Popup {
             return root;
         }
 
+        let positioner = if let Some(placement) = self.placement {
+            let mut trigger_bounds = state.read(cx).bounds;
+            // Popup's prepaint callback receives the legacy anchored-element convention: the
+            // origin is the trigger's bottom-left corner, while Positioner::side expects an
+            // ordinary top-left Bounds. Normalize once here so side placement can share the
+            // existing trigger capture without adding a second measurement element.
+            trigger_bounds.origin.y -= trigger_bounds.size.height;
+            Positioner::side(trigger_bounds)
+                .placement(placement)
+                .align(self.align)
+                .offset(self.offset)
+        } else {
+            Positioner::corner(anchor, position.get())
+        };
+
         root.child(
             deferred(
-                Positioner::corner(anchor, position.get())
-                    .margin(WINDOW_MARGIN)
+                positioner
+                    .margin(self.margin)
                     // The host blocks the mouse, so no caller has to remember:
                     // what a popup covers belongs to the popup.
                     .occlude()
                     .child(content),
             )
-            .with_priority(POPUP_PRIORITY),
+            .with_priority(self.priority),
         )
     }
 }
@@ -167,6 +224,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn side_positioning_options_are_configurable_without_changing_defaults() {
+        let popup = Popup::new("popup", div())
+            .placement(Placement::Bottom)
+            .align(Align::Start)
+            .offset(px(6.))
+            .margin(px(12.))
+            .priority(321);
+
+        assert_eq!(popup.placement, Some(Placement::Bottom));
+        assert_eq!(popup.align, Align::Start);
+        assert_eq!(popup.offset, px(6.));
+        assert_eq!(popup.margin, px(12.));
+        assert_eq!(popup.priority, 321);
+
+        let defaults = Popup::new("defaults", div());
+        assert_eq!(defaults.placement, None);
+        assert_eq!(defaults.margin, WINDOW_MARGIN);
+        assert_eq!(defaults.priority, POPUP_PRIORITY);
+    }
+
     struct Harness;
 
     impl Render for Harness {
@@ -183,6 +261,40 @@ mod tests {
                     .size(px(20.)),
             )
         }
+    }
+
+    struct SidePlacementHarness;
+
+    impl Render for SidePlacementHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            Popup::new(
+                "side-popup",
+                div()
+                    .debug_selector(|| "side-popup-trigger".into())
+                    .size(px(100.)),
+            )
+            .placement(Placement::Bottom)
+            .align(Align::Start)
+            .offset(px(8.))
+            .content(
+                div()
+                    .debug_selector(|| "side-popup-content".into())
+                    .size(px(20.)),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn side_positioning_starts_after_the_trigger_bounds(cx: &mut gpui::TestAppContext) {
+        let (_, window) = cx.add_window_view(|_, _| SidePlacementHarness);
+        window.update(|window, cx| window.draw(cx).clear(cx));
+        window.update(|window, cx| window.draw(cx).clear(cx));
+
+        let trigger = window.debug_bounds("side-popup-trigger").unwrap();
+        let content = window.debug_bounds("side-popup-content").unwrap();
+
+        assert_eq!(content.left(), WINDOW_MARGIN);
+        assert_eq!(content.top(), trigger.bottom() + px(8.));
     }
 
     /// A caller that styles its own surface — a hover card, a dropdown — does
