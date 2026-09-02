@@ -55,6 +55,13 @@ const MAX_HIGHLIGHT_LINE_LENGTH: usize = 10_000;
 const FOLD_CHEVRON_RIGHT_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>"#;
 const FOLD_CHEVRON_DOWN_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>"#;
 
+fn resolve_line_number_width(
+    configured: Option<Pixels>,
+    measure: impl FnOnce() -> Pixels,
+) -> Pixels {
+    configured.unwrap_or_else(measure)
+}
+
 fn compose_decorations(
     mut styles: Vec<(Range<usize>, HighlightStyle)>,
     decorations: impl IntoIterator<Item = (Range<usize>, HighlightStyle)>,
@@ -947,21 +954,23 @@ impl<M: InputModeKind> TextElement<M> {
         let line_number_len = total_lines.max(1).ilog10() as usize + 2;
 
         let mut line_number_width = if state.mode.line_number() {
-            let empty_line_number = window.text_system().shape_line(
-                "+".repeat(line_number_len).into(),
-                font_size,
-                &[TextRun {
-                    len: line_number_len,
-                    font: style.font(),
-                    color: gpui::black(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }],
-                None,
-            );
+            resolve_line_number_width(state.line_number_width, || {
+                let empty_line_number = window.text_system().shape_line(
+                    "+".repeat(line_number_len).into(),
+                    font_size,
+                    &[TextRun {
+                        len: line_number_len,
+                        font: style.font(),
+                        color: gpui::black(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                );
 
-            empty_line_number.width + LINE_NUMBER_RIGHT_MARGIN
+                empty_line_number.width + LINE_NUMBER_RIGHT_MARGIN
+            })
         } else if state.is_code_editor() {
             LINE_NUMBER_RIGHT_MARGIN
         } else {
@@ -2094,7 +2103,15 @@ impl<M: InputModeKind> Element for TextElement<M> {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (focus_handle, show_cursor, disabled, selected_range, editor_style, editor_paddings) = {
+        let (
+            focus_handle,
+            show_cursor,
+            disabled,
+            selected_range,
+            editor_style,
+            editor_paddings,
+            folding,
+        ) = {
             let state = self.state.read(cx);
             (
                 state.focus_handle.clone(),
@@ -2103,6 +2120,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 state.selected_range,
                 state.editor_style.clone(),
                 state.editor_paddings,
+                state.mode.is_folding(),
             )
         };
         let focused = focus_handle.is_focused(window);
@@ -2328,6 +2346,14 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 editor_paddings,
             );
             window.paint_quad(fill(gutter_bounds, gutter_bg));
+            let line_number_content_width = prepaint.last_layout.line_number_width
+                - LINE_NUMBER_RIGHT_MARGIN
+                - if folding {
+                    FOLD_ICON_HITBOX_WIDTH
+                } else {
+                    px(0.)
+                };
+            let line_number_content_width = line_number_content_width.max(px(0.));
 
             // Each item is the normal lines.
             for (lines, &buffer_line) in line_numbers
@@ -2352,7 +2378,14 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 }
 
                 for line in lines {
-                    _ = line.paint(p, line_height, TextAlign::Left, None, window, cx);
+                    _ = line.paint(
+                        p,
+                        line_height,
+                        TextAlign::Right,
+                        Some(line_number_content_width),
+                        window,
+                        cx,
+                    );
                     offset_y += line_height;
                 }
 
@@ -2762,6 +2795,15 @@ mod tests {
             ),
             Bounds::new(point(px(3.), px(18.)), size(px(55.), px(103.)))
         );
+    }
+
+    #[test]
+    fn test_configured_line_number_width_avoids_document_measurement() {
+        assert_eq!(
+            resolve_line_number_width(Some(px(56.)), || panic!("must not measure")),
+            px(56.)
+        );
+        assert_eq!(resolve_line_number_width(None, || px(32.)), px(32.));
     }
 
     #[test]

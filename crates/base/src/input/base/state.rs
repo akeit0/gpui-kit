@@ -321,6 +321,8 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) clean_on_escape: bool,
     pub(super) submit_on_enter: bool,
     pub(super) show_whitespaces: bool,
+    /// Fixed line-number column width. `None` sizes the column from the document line count.
+    pub(super) line_number_width: Option<Pixels>,
     /// This flag tells the renderer to prefer the end of the current visual line.
     pub(crate) cursor_line_end_affinity: bool,
     pub(super) pattern: Option<regex::Regex>,
@@ -638,6 +640,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             clean_on_escape: false,
             submit_on_enter: false,
             show_whitespaces: false,
+            line_number_width: None,
             loading: false,
             pattern: None,
             validate: None,
@@ -5328,11 +5331,34 @@ impl InputBaseState<crate::input::EditorMode> {
         self
     }
 
+    /// Set a fixed width for the line-number column.
+    ///
+    /// `None` keeps automatic sizing based on the document line count. The folding control, when
+    /// enabled, reserves its own space to the right of this column.
+    pub fn line_number_width(mut self, width: Option<Pixels>) -> Self {
+        self.line_number_width = width.filter(|width| *width > px(0.));
+        self
+    }
+
     /// Set line number.
     pub fn set_line_number(&mut self, line_number: bool, _: &mut Window, cx: &mut Context<Self>) {
         if let LayoutMode::CodeEditor { line_number: l, .. } = &mut self.mode {
             *l = line_number;
         }
         cx.notify();
+    }
+
+    /// Set the fixed line-number column width at runtime.
+    pub fn set_line_number_width(
+        &mut self,
+        width: Option<Pixels>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let width = width.filter(|width| *width > px(0.));
+        if self.line_number_width != width {
+            self.line_number_width = width;
+            cx.notify();
+        }
     }
 }
