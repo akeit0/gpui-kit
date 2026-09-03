@@ -1,13 +1,13 @@
 ---
 title: Coding Guides
-description: Architecture and coding conventions for maintainable GPUI Component applications
+description: Architecture and coding conventions for maintainable GPUI Kit applications
 order: -2.2
 ---
 
 # Coding Guides
 
 This guide describes the application architecture and code patterns that have
-proved durable in GPUI Component. It is written for both engineers and coding
+proved durable in GPUI Kit. It is written for both engineers and coding
 agents. Read [Design Guides](./design-guides.md) first: code structure should
 preserve product intent, not replace it.
 
@@ -459,7 +459,7 @@ what it does.
 
 Preserve semantic roles in the element choice. Use `Button` for commands even
 when the desired treatment is quiet—select `outline`, `ghost`, or an icon
-presentation instead of replacing it with `Link`. GPUI Component applications
+presentation instead of replacing it with `Link`. GPUI Kit applications
 reserve `Link` for targets opened by a browser or mail client, such as a URL,
 web document, or email address. Use the relevant navigation component for an
 in-app destination and `Button`/`Action` for a command. This is a product
@@ -509,6 +509,22 @@ after the request, document, view, or selection has changed; attach a revision
 or identity and reject stale work rather than applying it to new state.
 
 ## Layout, measurement, and scrolling
+
+`h_flex` centres its children on the cross axis; `v_flex` leaves flexbox's
+default, `stretch`. This matches Zed's `h_flex`, and it is what a row of
+controls wants, so a row of icon and label says nothing. It is not what a row
+of full-height columns wants: a column placed in a bare `h_flex` does not fill
+the row's height, so a column taller than the row is centred and its top —
+commonly a header — is clipped off the top of the window, with nothing near the
+column to say why. A row whose children are columns says `items_stretch()`:
+
+```rust
+h_flex()
+    .items_stretch()
+    .size_full()
+    .child(sidebar)
+    .child(content)
+```
 
 Most UI should use GPUI layout rather than measuring itself. Measurement is a
 deep behavior tool for popups, virtualization, editors, resize handles, charts,

@@ -1483,6 +1483,27 @@ const ELEMENT_METHODS: &str = r#"    /**
      */
     on_item_click(handler: (key: string, cx: Context) => void): Element;
     /**
+     * `handler(key, event, cx)` on a secondary press — the right button — over
+     * a row of a virtual list. `key` is what the list's `get_key(index)`
+     * returned for that row, and `event` is the press as `on_mouse_down`
+     * reports it: `position` in the window, `local_position` and `bounds`
+     * against the row's own box.
+     *
+     * A press rather than a click, because that is when a context menu opens:
+     * the row is still under the pointer, so the menu can name what it is for
+     * before it is drawn over it. And one handler for the list rather than one
+     * per row, for the reason `on_item_click` gives.
+     *
+     * It is delivered on the row, so a handler for the same button on an
+     * element around the list still fires after it, in the ordinary bubble
+     * order, with that element's own `local_position`. A menu drawn inside a
+     * pane learns which row was pressed from this handler and where in the
+     * pane to open from the pane's.
+     */
+    on_item_secondary_click(
+      handler: (key: string, event: MouseButtonEvent, cx: Context) => void,
+    ): Element;
+    /**
      * `handler(value, cx)`, on a toggle. The script owns the new value.
      *
      * A `Radio` only ever reports `true`. It cannot deselect itself, so an
@@ -3471,16 +3492,48 @@ const BASE_IMPORTS: &str = r#"  import {
 
 "#;
 
-/// The `gpui-fps` performance overlay: one element, from the crate that draws it.
+/// The `gpui-fps` performance overlay: the element form, and the HUD the
+/// window root draws on a script's behalf.
 const FPS: &str = r#"  /**
    * The native `gpui-fps` performance HUD, shared once per window and pinned
    * to the top-right by default. Its parent must be `relative()`.
+   *
+   * Prefer `show_fps_monitor()`: a HUD placed inside the script's own tree is
+   * rebuilt with it, and what the tree does then counts against the reading.
    */
   export function fps_monitor(): Element;
+
+  /** Where the root-owned HUD sits and how it behaves. Every key is optional. */
+  export interface FpsMonitorOptions {
+    /** Corner or edge of the window. Default `top_right`. */
+    anchor?: Anchor;
+    /**
+     * Whether the HUD requests a redraw after every frame, so the rate it
+     * shows is the rate the window *can* sustain. Default `false`: the HUD
+     * observes the application's own frames and reads zero while it idles.
+     */
+    continuous?: boolean;
+    /** Frame budget in milliseconds, for the FRAME grading and the chart's scale. */
+    frame_budget?: number;
+  }
+
+  /**
+   * Draws the performance HUD over the whole window, above every overlay,
+   * until `hide_fps_monitor()`. The window root owns it: the script says
+   * whether and where, and nothing the script renders can move it, rebuild
+   * it, or count against it. Calling it again moves or reconfigures the HUD
+   * that is already up; the monitor behind it keeps its history across a hide
+   * and a show. Needs a live host call: `init()`, an event handler or a task.
+   */
+  export function show_fps_monitor(options?: FpsMonitorOptions): void;
+  /** Takes the HUD down. `true` if one was up. */
+  export function hide_fps_monitor(): boolean;
+  /** Whether the root-owned HUD is up. */
+  export function fps_monitor_visible(): boolean;
 "#;
 
-/// What `gpui-fps`'s one declaration borrows from `"gpui"`.
-const FPS_IMPORTS: &str = r#"  import { Element } from "gpui";
+/// What `gpui-fps`'s declarations borrow from `"gpui"`.
+const FPS_IMPORTS: &str = r#"  import { Anchor, Element } from "gpui";
 
 "#;
 
@@ -3783,6 +3836,7 @@ mod tests {
         "aria_level",
         "keep_mounted",
         "on_item_click",
+        "on_item_secondary_click",
         "on_change",
         "on_step",
         "on_open_change",

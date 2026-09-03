@@ -2358,6 +2358,66 @@ export default class Themed extends View {
 }
 
 #[gpui::test]
+fn repeated_theme_reads_cross_the_snapshot_boundary_once(cx: &mut TestAppContext) {
+    cx.update(crate::init);
+    let runtime = ShellRuntime::new_isolated().expect("runtime");
+    cx.update(|cx| runtime.set_global(cx));
+    let source = r#"
+import { View } from "gpui";
+
+let snapshotReads = 0;
+const readSnapshot = globalThis.__theme_snapshot;
+globalThis.__theme_snapshot = () => {
+  snapshotReads += 1;
+  return readSnapshot();
+};
+
+export default class Themed extends View {
+  render(cx) {
+    cx.theme();
+    cx.theme();
+    cx.theme();
+    return `${snapshotReads}:${cx.theme().appearance}`;
+  }
+}
+"#;
+    let view_type = runtime
+        .load_source("cached-context-theme.js", source)
+        .expect("load");
+    let window = cx.add_window(|_, _| Empty);
+    let mut context = VisualTestContext::from_window(*window.deref(), cx);
+    let object = context
+        .update(|window, cx| runtime.instantiate(&view_type, window, cx))
+        .expect("instantiate");
+
+    let first = context
+        .update(|window, cx| runtime.render_to_spec(&object, None, window, cx))
+        .expect("one render must transfer one theme snapshot");
+    assert!(
+        first.contains("text \"1:light\""),
+        "unexpected theme: {first}"
+    );
+    let unchanged = context
+        .update(|window, cx| runtime.render_to_spec(&object, None, window, cx))
+        .expect("an unchanged later render must reuse the transferred theme snapshot");
+    assert!(
+        unchanged.contains("text \"1:light\""),
+        "unchanged theme crossed the snapshot boundary again: {unchanged}"
+    );
+
+    context.update(|_, cx| {
+        gpui_base::Theme::global_mut(cx).appearance = gpui_base::ThemeAppearance::Dark;
+    });
+    let changed = context
+        .update(|window, cx| runtime.render_to_spec(&object, None, window, cx))
+        .expect("a changed appearance must refresh the transferred theme snapshot");
+    assert!(
+        changed.contains("text \"2:dark\""),
+        "changed theme did not cross the snapshot boundary exactly once: {changed}"
+    );
+}
+
+#[gpui::test]
 fn render_context_theme_snapshot_is_deeply_read_only(cx: &mut TestAppContext) {
     cx.update(crate::init);
     let runtime = ShellRuntime::new_isolated().expect("runtime");
@@ -9573,6 +9633,98 @@ export default class Rows extends View {{
 }}
 "#
     )
+}
+
+#[gpui::test]
+fn a_secondary_press_on_a_row_reports_its_key_and_the_press(cx: &mut TestAppContext) {
+    cx.update(crate::init);
+    let runtime = ShellRuntime::new_isolated().expect("runtime");
+    cx.update(|cx| runtime.set_global(cx));
+    let source = r#"
+import { View, div } from "gpui";
+import { v_flex, v_virtual_list } from "gpui-base";
+
+export default class Rows extends View {
+  init() {
+    this.items = ["alpha", "beta", "gamma"];
+    this.pressed = "none";
+    this.clicked = "none";
+  }
+  render(cx) {
+    return v_flex()
+      .w(300)
+      .h(200)
+      .child(
+        v_virtual_list(
+          "rows",
+          this.items.length,
+          40,
+          (index) => this.items[index],
+          (range) => {
+            const rows = [];
+            for (let index = range.start; index < range.end; index++) {
+              rows.push(div().h(40).child(this.items[index]));
+            }
+            return rows;
+          },
+        )
+          .on_item_click((key, cx) => {
+            this.clicked = key;
+            cx.notify();
+          })
+          .on_item_secondary_click((key, event, cx) => {
+            this.pressed = `${key} ${event.button} at ${Math.round(event.local_position.y)} of ${Math.round(event.bounds.height)}`;
+            cx.notify();
+          }),
+      )
+      .child(`pressed ${this.pressed} clicked ${this.clicked}`);
+  }
+}
+"#;
+    let view_type = runtime
+        .load_source("pressed-list.js", source)
+        .expect("load");
+    let runtime_for_view = Rc::clone(&runtime);
+    let window = cx.add_window(move |window, cx| {
+        let view = runtime_for_view
+            .instantiate_view(&view_type, window, cx)
+            .expect("instantiate");
+        RootedScriptView(view)
+    });
+    let mut context = VisualTestContext::from_window(*window.deref(), cx);
+    context.update(|window, cx| window.draw(cx).clear(cx));
+    context.update(|window, cx| window.draw(cx).clear(cx));
+    let view = window
+        .root(&mut context)
+        .expect("view")
+        .read_with(&context, |root, _| root.0.clone());
+
+    // The second row spans 40..80; press ten pixels into it.
+    context.simulate_mouse_move(
+        point(px(150.), px(50.)),
+        gpui::MouseButton::Right,
+        Modifiers::default(),
+    );
+    context.simulate_mouse_down(
+        point(px(150.), px(50.)),
+        gpui::MouseButton::Right,
+        Modifiers::default(),
+    );
+    context.run_until_parked();
+    context.update(|window, cx| window.draw(cx).clear(cx));
+
+    let tree = context.update(|_, cx| {
+        view.read(cx)
+            .snapshot()
+            .map(crate::RenderSnapshot::debug_tree)
+            .unwrap_or_default()
+    });
+    // The key names the row, the press is measured from that row's own box,
+    // and a right press is not a click.
+    assert!(
+        tree.contains("pressed beta right at 10 of 40 clicked none"),
+        "a right press must reach the list's secondary handler with the row it landed on:\n{tree}"
+    );
 }
 
 /// Rebuilds the description so that what the item renderer recorded during the

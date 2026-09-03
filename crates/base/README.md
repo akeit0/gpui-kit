@@ -265,7 +265,8 @@ Tokens describe design semantics; they do not automatically style unstyled contr
 
 | API                               | Purpose                                                                 |
 | --------------------------------- | ----------------------------------------------------------------------- |
-| `History` / `HistoryItem`         | Undo and redo history with grouping, deduplication, and capacity limits |
+| `History`                         | Browser-style navigation trail with back and forward entries             |
+| `UndoHistory`                     | Grouped undo and redo transactions                                      |
 | `SliderState`                     | Single or range values, linear or logarithmic scales, and slider events |
 | `IndexPath`                       | A section, row, and column index path                                   |
 | `Placement` / `Side`              | Placement and layout direction descriptions                             |
@@ -320,8 +321,8 @@ style and motion contracts.
 
 ## Related Resources
 
-- [GPUI Component repository](https://github.com/longbridge/gpui-component)
-- [GPUI Component documentation](https://longbridge.github.io/gpui-component)
+- [GPUI Kit repository](https://github.com/longbridge/gpui-component)
+- [GPUI Kit documentation](https://gpui-kit.com)
 - [`gpui-component` crate](https://crates.io/crates/gpui-component)
 - [`gpui-base` API documentation](https://docs.rs/gpui-base)
 - [GPUI](https://gpui.rs)

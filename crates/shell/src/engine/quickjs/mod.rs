@@ -1104,8 +1104,14 @@ pub(crate) mod exports {
         "set_theme",
     ];
 
-    /// The performance overlay, owned by `gpui-fps`.
-    pub(crate) const GPUI_FPS: &[&str] = &["fps_monitor"];
+    /// The performance overlay, owned by `gpui-fps`: the element form, and
+    /// the root-owned HUD a script switches on and off.
+    pub(crate) const GPUI_FPS: &[&str] = &[
+        "fps_monitor",
+        "show_fps_monitor",
+        "hide_fps_monitor",
+        "fps_monitor_visible",
+    ];
 
     /// Shell-owned shared types. Module components are exported from their
     /// host modules rather than through a public generic dispatcher.
@@ -2887,6 +2893,10 @@ impl ShellRuntime {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<RenderSnapshot> {
+        // One theme sync per description makes cx.theme() a JS-only cache read.
+        // The native snapshot crosses the boundary only when this revision
+        // changes, rather than once per component asking for the theme.
+        crate::theme_tokens::sync(cx);
         self.arena.borrow_mut().reset();
         let callbacks = self.callbacks.borrow_mut().begin();
 
@@ -3400,8 +3410,47 @@ impl ShellRuntime {
         window: &mut Window,
         cx: &mut App,
     ) {
+        self.dispatch_item(id, "item click", window, cx, |_, handler, context| {
+            handler.call::<_, ()>((key, context))
+        });
+    }
+
+    /// Delivers a secondary press on a virtual list row: the row's key, then
+    /// the press exactly as `on_mouse_down` would report it, with
+    /// `local_position` measured from the row's own box.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_item_mouse_button(
+        self: &Rc<Self>,
+        id: CallbackId,
+        key: &str,
+        button: gpui::MouseButton,
+        position: gpui::Point<gpui::Pixels>,
+        click_count: usize,
+        modifiers: gpui::Modifiers,
+        bounds: Option<gpui::Bounds<gpui::Pixels>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.dispatch_item(id, "item press", window, cx, |ctx, handler, context| {
+            let event =
+                mouse_button_payload(ctx, button, position, click_count, modifiers, bounds)?;
+            handler.call::<_, ()>((key, event, context))
+        });
+    }
+
+    /// The lifetime checks, scope entry and job drain every row-level dispatch
+    /// shares. The call itself is the caller's, because the two row events
+    /// hand the handler different argument lists.
+    fn dispatch_item(
+        self: &Rc<Self>,
+        id: CallbackId,
+        what: &str,
+        window: &mut Window,
+        cx: &mut App,
+        call: impl for<'js> FnOnce(&Ctx<'js>, Function<'js>, Object<'js>) -> JsResult<()>,
+    ) {
         let Some(entry) = self.callbacks.borrow().get(id) else {
-            tracing::debug!("item callback {id} belongs to a superseded render pass");
+            tracing::debug!("{what} callback {id} belongs to a superseded render pass");
             return;
         };
 
@@ -3410,12 +3459,12 @@ impl ShellRuntime {
             .as_ref()
             .is_some_and(|application| !application.is_active())
         {
-            tracing::debug!("item callback {id} belongs to a retired application");
+            tracing::debug!("{what} callback {id} belongs to a retired application");
             return;
         }
 
         let Some(view) = entry.live_view() else {
-            tracing::debug!("item callback {id} owner has been released");
+            tracing::debug!("{what} callback {id} owner has been released");
             return;
         };
         let policy = view
@@ -3434,11 +3483,12 @@ impl ShellRuntime {
 
         let result = self.with_js(|ctx| {
             let handler = entry.value.clone().restore(ctx)?;
-            handler.call::<_, ()>((key, context_object(ctx, ContextBinding::Call(generation))?))
+            let context = context_object(ctx, ContextBinding::Call(generation))?;
+            call(ctx, handler, context)
         });
 
         if let Err(error) = result {
-            tracing::error!("error in item click handler: {error}");
+            tracing::error!("error in {what} handler: {error}");
         }
         scheduler::drain_runtime_jobs(self, window, cx);
     }
@@ -3891,19 +3941,7 @@ impl ShellRuntime {
         cx: &mut App,
     ) {
         self.dispatch_simple_event(id, "mouse button", window, cx, move |ctx| {
-            let payload = Object::new(ctx.clone())?;
-            payload.set(
-                "button",
-                match button {
-                    gpui::MouseButton::Right => "right",
-                    gpui::MouseButton::Middle => "middle",
-                    _ => "left",
-                },
-            )?;
-            payload.set("click_count", click_count as u32)?;
-            set_pointer_geometry(ctx, &payload, position, bounds)?;
-            payload.set("modifiers", modifiers_object(ctx, modifiers)?)?;
-            Ok(payload)
+            mouse_button_payload(ctx, button, position, click_count, modifiers, bounds)
         });
     }
 
@@ -4634,6 +4672,8 @@ impl ShellRuntime {
 
     fn call_render_once(&self, object: &ViewObject, generation: u64) -> Result<SpecId> {
         self.with_js(|ctx| {
+            let prepare_theme: Function = ctx.globals().get("__prepare_theme")?;
+            prepare_theme.call::<_, ()>(())?;
             let instance = object.value.clone().restore(ctx)?;
             let render: Function = instance.get("render").map_err(|_| {
                 Exception::throw_message(ctx, "view class has no render(cx) method")
@@ -6209,7 +6249,11 @@ globalThis.__gpui = (() => {
 
   let cachedThemeSource;
   let cachedTheme;
-  const currentTheme = () => {
+  let cachedThemeRevision = -1;
+  globalThis.__theme_dirty = true;
+  const refreshTheme = () => {
+    const revision = __theme_revision();
+    if (!globalThis.__theme_dirty && revision === cachedThemeRevision) return;
     const source = __theme_snapshot();
     if (source !== cachedThemeSource) {
       cachedThemeSource = source;
@@ -6219,6 +6263,12 @@ globalThis.__gpui = (() => {
       Object.freeze(cachedTheme.radius);
       Object.freeze(cachedTheme);
     }
+    cachedThemeRevision = revision;
+    globalThis.__theme_dirty = false;
+  };
+  globalThis.__prepare_theme = refreshTheme;
+  const currentTheme = () => {
+    if (globalThis.__theme_dirty || cachedTheme === undefined) refreshTheme();
     return cachedTheme;
   };
 
@@ -6437,6 +6487,9 @@ globalThis.__gpui = (() => {
     ProgressTrack: { new: () => element(__progress_track()) },
     ProgressIndicator: { new: () => element(__progress_indicator()) },
     fps_monitor: () => element(__fps_monitor()),
+    show_fps_monitor: (options) => __show_fps_monitor(options),
+    hide_fps_monitor: () => __hide_fps_monitor(),
+    fps_monitor_visible: () => __fps_monitor_visible(),
     Radio: { new: (id) => element(__radio(String(id))) },
     Toggle: { new: (id) => element(__toggle(String(id))) },
     RadioGroup: { new: (id) => element(__radio_group(String(id))) },
@@ -6666,6 +6719,7 @@ impl ShellRuntime {
                 "aria_level",
                 "keep_mounted",
                 "on_item_click",
+                "on_item_secondary_click",
                 "on_change",
                 "on_open_change",
                 "on_confirm",
@@ -7610,6 +7664,7 @@ impl ShellRuntime {
             | "on_dismiss"
             | "on_step"
             | "on_item_click"
+            | "on_item_secondary_click"
             | "on_mouse_move"
             | "on_hover"
             | "on_key_down"
@@ -7640,8 +7695,10 @@ impl ShellRuntime {
                             "`{method}` cannot be registered from a virtual list's item \
                              renderer: the rows are rebuilt every frame, so a handler \
                              registered there would pile up for as long as the view stood. \
-                             Use `on_item_click((key, cx) => ...)` on the list itself, and \
-                             read the row out of your own data with the stable key it gives you"
+                             Use `on_item_click((key, cx) => ...)` or \
+                             `on_item_secondary_click((key, event, cx) => ...)` on the list \
+                             itself, and read the row out of your own data with the stable key \
+                             it gives you"
                         ),
                     ));
                 }
@@ -8940,6 +8997,32 @@ fn modifiers_object<'js>(ctx: &Ctx<'js>, modifiers: gpui::Modifiers) -> JsResult
 /// that has not been prepainted yet, so a script reading `undefined` knows the
 /// geometry was unavailable instead of being told the press landed at its
 /// top-left corner.
+/// The object an `on_mouse_down` or `on_mouse_up` handler is handed, built in
+/// one place so a press reported through a row carries the same fields as one
+/// reported through the element it landed on.
+fn mouse_button_payload<'js>(
+    ctx: &Ctx<'js>,
+    button: gpui::MouseButton,
+    position: gpui::Point<gpui::Pixels>,
+    click_count: usize,
+    modifiers: gpui::Modifiers,
+    bounds: Option<gpui::Bounds<gpui::Pixels>>,
+) -> JsResult<Object<'js>> {
+    let payload = Object::new(ctx.clone())?;
+    payload.set(
+        "button",
+        match button {
+            gpui::MouseButton::Right => "right",
+            gpui::MouseButton::Middle => "middle",
+            _ => "left",
+        },
+    )?;
+    payload.set("click_count", click_count as u32)?;
+    set_pointer_geometry(ctx, &payload, position, bounds)?;
+    payload.set("modifiers", modifiers_object(ctx, modifiers)?)?;
+    Ok(payload)
+}
+
 fn set_pointer_geometry<'js>(
     ctx: &Ctx<'js>,
     payload: &Object<'js>,
@@ -9424,6 +9507,7 @@ fn callback_op_name(method: &str) -> Option<&'static str> {
         "on_mouse_down_out" => "on_mouse_down_out",
         "on_scroll_wheel" => "on_scroll_wheel",
         "on_item_click" => "on_item_click",
+        "on_item_secondary_click" => "on_item_secondary_click",
         "on_resize" => "on_resize",
         "tab_bar" => "tab_bar",
         "empty_group" => "empty_group",
