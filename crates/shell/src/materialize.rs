@@ -10,13 +10,13 @@
 //! but only to dispatch events: no path through this module calls into the
 //! script while an element is being built.
 //!
-//! # The one exception: `VirtualList`
+//! # The one exception: the lazy lists
 //!
-//! A virtualized list is the single component whose description is not the
+//! A lazy list is the single kind of component whose description is not the
 //! whole of what it draws. Its rows are produced by a script callback that
 //! GPUI runs from *inside* layout and prepaint — twice per frame, once to
-//! measure and once to place — so a frame that contains a virtual list does
-//! enter the VM, once per list, no matter what changed.
+//! measure and once to place — so a frame that contains one does enter the VM,
+//! no matter what changed.
 //!
 //! That is not a leak in the design; it is the trade the design was for. The
 //! alternative is describing every row up front, which is exactly the cost
@@ -24,6 +24,16 @@
 //! can be seen. What the exception buys is that the VM is entered for the
 //! *visible window* rather than for the collection, so the script cost of a
 //! ten-thousand-row list is the script cost of a twenty-row one.
+//!
+//! How often it is entered depends on which list, because that is set by the
+//! GPUI API each one wraps. [`Component::VirtualList`] and `uniform_list` take
+//! a renderer over a range, so one frame is one call however many rows are on
+//! screen. `list` — the one that measures each item rather than placing them
+//! all by one — takes a renderer over a single index, so one frame is *one
+//! call per visible row*, plus the rows in its overdraw band. Both are bounded
+//! by the viewport rather than by the collection, which is the property that
+//! matters; but a `list` of twenty visible rows costs twenty crossings where a
+//! virtual list costs one, and that is the price of not stating heights.
 //!
 //! Three things confine it, and they are worth naming because each is what
 //! stops the exception from spreading:
@@ -505,7 +515,6 @@ struct Behavior {
     /// component's own default, and the two differ: a popover anchors top-left,
     /// a hover card top-center.
     anchor: Option<gpui::Anchor>,
-    continuous: Option<bool>,
     frame_budget: Option<Duration>,
     /// The pointer button that opens a `Popover`.
     mouse_button: Option<MouseButton>,
@@ -670,6 +679,18 @@ pub fn materialize(
             cx,
         )
     })
+}
+
+/// Builds the same eager element tree as a view render, preserving registered
+/// component failures for a source check instead of only showing a fallback.
+/// Deferred slots, nested views, and layout callbacks are not driven here.
+pub(crate) fn try_materialize(
+    runtime: &Rc<ShellRuntime>,
+    snapshot: &RenderSnapshot,
+    window: &mut Window,
+    cx: &mut App,
+) -> anyhow::Result<AnyElement> {
+    with_error_frame(|| materialize(runtime, snapshot, window, cx))
 }
 
 /// Materializes one described subtree from an arena that is not a snapshot's.
@@ -1420,6 +1441,9 @@ fn materialize_component(
         }
         Component::DockContent => components::dock::dock_content(refinement, behavior, children),
         Component::VirtualList(spec) => components::virtual_list::virtual_list(
+            runtime, &spec, refinement, behavior, states, children, window, cx,
+        ),
+        Component::List(spec) => components::list::list(
             runtime, &spec, refinement, behavior, states, children, window, cx,
         ),
         Component::Input(handle) => {
@@ -2288,6 +2312,7 @@ fn motion_element_id(
         // key its scroll position is filed under, so motion has to follow the
         // same name rather than a tree position.
         Component::VirtualList(spec) => gpui::ElementId::Name(spec.id().to_owned().into()),
+        Component::List(spec) => gpui::ElementId::Name(spec.id().to_owned().into()),
         // The group's id is also where base files the panel sizes, so motion
         // has to key off the same name rather than a tree position.
         Component::Resizable(id, _) => gpui::ElementId::Name(id.clone().into()),
@@ -2710,7 +2735,7 @@ fn checked_milliseconds(ms: f64) -> Option<Duration> {
 /// Written out rather than derived: GPUI has no name table for `Anchor`, and
 /// the script API is the snake_case spelling of the variant. One list serves
 /// the parser below, the check the prelude makes at the call site, and the
-/// union `gpui.d.ts` declares — so the three cannot drift.
+/// union `gpui-kit.d.ts` declares — so the three cannot drift.
 pub(crate) const ANCHOR_NAMES: [&str; 8] = [
     "top_left",
     "top_right",
@@ -3116,7 +3141,6 @@ fn apply_behavior(behavior: &mut Behavior, name: &str, args: &[Bridged]) {
                 .and_then(|value| value.as_str().ok())
                 .and_then(|value| anchor_from_name(value));
         }
-        "continuous" => behavior.continuous = Some(flag.unwrap_or(true)),
         "frame_budget" => behavior.frame_budget = milliseconds(args),
         "mouse_button" => {
             behavior.mouse_button =
@@ -3285,7 +3309,7 @@ mod motion_identity_tests {
     }
 
     /// One written list of anchors serves the parser, the check the prelude
-    /// makes at the call site and the union in `gpui.d.ts`. A declared name
+    /// makes at the call site and the union in `gpui-kit.d.ts`. A declared name
     /// that does not parse is a name a script could type and the runtime would
     /// silently drop.
     #[test]

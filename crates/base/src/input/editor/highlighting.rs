@@ -59,6 +59,25 @@ pub type InputHighlighterFactory = Rc<dyn Fn(&str) -> Option<Box<dyn InputHighli
 pub type SharedHighlightStyleResolver = Arc<dyn HighlightStyleResolver>;
 pub type FoldIconRenderer = Rc<dyn Fn(usize, bool) -> AnyElement>;
 
+/// Where in the syntax tree an offset sits, for editing decisions.
+///
+/// Parser-independent: `gpui-component` answers from tree-sitter, apps may
+/// answer heuristically. `None` (no provider installed) means `Code`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntaxContext {
+    Code,
+    String,
+    Comment,
+}
+
+/// Answers syntax context for editing decisions (pairing, skip, indent).
+///
+/// Created per editor by the application's [`super::LanguageProvider`].
+/// Base never imports a parser; implementations live in UI crates or apps.
+pub trait SyntaxContextProvider {
+    fn context_at(&self, text: &Rope, offset: usize) -> SyntaxContext;
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct DiagnosticColors {
     pub error: Hsla,
@@ -93,7 +112,7 @@ impl InputEditorStyle {
     /// means for ink, which is what makes it usable as "unset" here.
     ///
     /// This is resolution, not assignment: whatever a consumer did project is
-    /// kept exactly. `crates/ui` projects the whole style on every render and
+    /// kept exactly. `crates/component` projects the whole style on every render and
     /// never reaches this; a consumer that projects once at construction gets
     /// the palette that is current now rather than the one that happened to be
     /// installed when the state was built.

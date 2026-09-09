@@ -73,7 +73,7 @@ crate 边界也是工程边界。它让 Cargo 只重编译和测试较小的依�
 
 ```rust
 app.run(move |cx| {
-    gpui_component::init(cx);
+    gpui_kit::init(cx);
 
     cx.spawn(async move |cx| {
         cx.open_window(WindowOptions::default(), |window, cx| {
@@ -298,7 +298,7 @@ Pointer-specific 行为使用 pointer callback；需要 key binding、menu 或�
 
 一个 logical desktop command 只建模一次。Toolbar Button、`DropdownMenu` item、`ContextMenu` item、menu-bar item 与 key binding 应 dispatch 同一个 Action 或调用同一 owner method，不能复制五份 mutation。条件允许时，label、icon、shortcut、enabled state 来自同一 command policy，避免不同入口互相矛盾。Menu 拥有 navigation 与 dismiss；feature owner 仍然拥有 command 是否允许以及实际执行内容。
 
-控件选择必须符合语义。命令即使需要降低强调，也应使用 `Button` 的 `outline`、`ghost` 或图标形式，不能换成 `Link`。GPUI Kit 应用约定：`Link` 只用于交给浏览器或邮件客户端打开的 URL、网页文档和电子邮件地址；应用内目标使用相应的导航组件，命令使用 `Button` 或`Action`。这是产品设计约定，不是 `gpui_base::Link` 的能力限制；后者可以通过 `open_with`把目标交给其他导航实现。
+控件选择必须符合语义。命令即使需要降低强调，也应使用 `Button` 的 `outline`、`ghost` 或图标形式，不能换成 `Link`。GPUI Kit 应用约定：`Link` 只用于交给浏览器或邮件客户端打开的 URL、网页文档和电子邮件地址；应用内目标使用相应的导航组件，命令使用 `Button` 或`Action`。这是产品设计约定，不是 `gpui_kit::base::Link` 的能力限制；后者可以通过 `open_with`把目标交给其他导航实现。
 
 只有 nested interaction 确实必须阻止 parent 处理同一 event 时才 stop propagation。无差别阻止会破坏 menu、selection、drag 与 window command。
 
@@ -384,7 +384,7 @@ Reusable component 应遵守：
 - explicit compound part 优于检查 arbitrary descendant；
 - reusable behavior 不能强制 product-level visual choice。
 
-需要持续演进的行为状态默认使用私有字段。配置、主题令牌、几何数据和序列化结构如果本来就是记录类型，并且直接构造属于公开契约，可以有意暴露字段，同时接受相应的兼容成本。调用方可以读取、但不应依赖穷举构造或匹配时，使用 `#[non_exhaustive]`。
+需要持续演进的行为状态默认使用私有字段。配置、主题令牌、几何数据和序列化结构可以有意暴露字段，但所有包含公开字段的 `pub struct` 必须标注 `#[non_exhaustive]`，并提供构造函数、`Default` 或 builder，避免调用方依赖穷举结构体字面量。这使后续增加字段无需破坏调用方。新类型及公开 API 调整必须遵守此规则；无关的已有类型另行迁移。
 
 内部重组时保持 public module path：通过稳定 module seam 和明确 re-export，让 folder 变化不影响 downstream import。命名优先使用平台 control 术语和项目既有词汇，不使用偶然的 web-framework 词汇。
 
