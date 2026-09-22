@@ -1,10 +1,14 @@
 use futures::Stream as _;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
 use std::{
-    ops::RangeInclusive,
+    ops::{Range, RangeInclusive},
     pin::Pin,
     sync::{Arc, Mutex},
     task::Poll,
 };
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 
 use gpui::{
     App, AppContext as _, Bounds, Context, FocusHandle, IntoElement, KeyBinding, ListState,
@@ -23,6 +27,7 @@ use crate::{
         format,
         node::{self, NodeContext},
         selection_adapter::TextViewSelectionAdapter,
+        stream_fade::{StreamFadeTracker, TextViewMotion},
     },
     v_flex,
 };
@@ -99,7 +104,7 @@ pub struct TextViewState {
     pub(super) line_spans: Arc<Mutex<Vec<LineSpan>>>,
     /// Whether the last painted frame clipped content due to `max_lines`.
     pub(super) clamped: bool,
-    pub(super) text_view_style: TextViewStyle,
+    pub(super) text_view_style: Arc<TextViewStyle>,
     pub(super) code_block_actions: Option<std::sync::Arc<CodeBlockActionsFn>>,
     pub(super) code_block_highlighter: Option<std::sync::Arc<CodeBlockHighlighterFn>>,
     pub(super) table_actions: Option<std::sync::Arc<TableActionsFn>>,
@@ -107,6 +112,8 @@ pub struct TextViewState {
     pub(super) markdown_extensions: Arc<MarkdownExtensions>,
 
     pub(super) is_selecting: bool,
+    /// Logical ranges retained across an explicitly requested resource reflow.
+    pub(super) preserve_inline_selection: bool,
     multi_click_selection: Option<TextViewMultiClickSelection>,
     selected_text_override: Option<String>,
     select_all: bool,
@@ -114,13 +121,18 @@ pub struct TextViewState {
     pub(super) selection_adapter: TextViewSelectionAdapter,
 
     pub(super) parsed_content: ParsedContent,
+    pub(super) stream_fade: StreamFadeTracker,
     /// Content format (markdown / html), used for bounded synchronous parsing
     /// of small full-replace updates.
     format: TextViewFormat,
     text: String,
+    /// The text a `TextView` element last handed over, to recognize the same
+    /// string next frame without comparing its bytes.
+    element_text: Option<SharedString>,
     revision: usize,
     pub(super) selection_revision: usize,
     compatible_layout_update: bool,
+    layout_text_style: Option<(gpui::TextStyle, Pixels)>,
     parsed_error: Option<SharedString>,
     tx: Sender<UpdateOptions>,
     _parse_task: Task<()>,
@@ -159,6 +171,11 @@ impl TextViewState {
 
                         match parsed_update.result {
                             Ok(content) => {
+                                state.stream_fade.record(
+                                    &state.parsed_content.document,
+                                    &content.document,
+                                    Instant::now(),
+                                );
                                 state.parsed_content = content;
                                 state.parsed_error = None;
                                 state.compatible_layout_update = parsed_update.selection_compatible;
@@ -167,6 +184,7 @@ impl TextViewState {
                                 }
                             }
                             Err(err) => {
+                                state.stream_fade.discard_pending();
                                 state.parsed_error = Some(err);
                             }
                         }
@@ -201,22 +219,26 @@ impl TextViewState {
             // as zero height until scrolled into view, which makes the
             // scrollbar jitter as more blocks get measured during scrolling.
             list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)).measure_all(),
-            text_view_style: TextViewStyle::default(),
+            text_view_style: Arc::default(),
             code_block_actions: None,
             code_block_highlighter: None,
             table_actions: None,
             link_click_handler: None,
             markdown_extensions: Arc::default(),
             is_selecting: false,
+            preserve_inline_selection: false,
             auto_scroll: AutoScroll::default(),
             selection_adapter,
             parsed_content: Default::default(),
+            stream_fade: StreamFadeTracker::default(),
             format,
             parsed_error: None,
             text: text.to_string(),
+            element_text: None,
             revision: 0,
             selection_revision: 0,
             compatible_layout_update: false,
+            layout_text_style: None,
             tx,
             _parse_task,
             _receive_task,
@@ -280,9 +302,20 @@ impl TextViewState {
     }
 
     /// Set the text content.
+    ///
+    /// With a streamed fade-in enabled, text that extends the current text
+    /// fades in like [`Self::push_str`] would; any other replacement shows at
+    /// once.
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if self.text.as_str() == text {
             return;
+        }
+        if self.stream_fade.is_enabled() {
+            if text.starts_with(self.text.as_str()) {
+                self.stream_fade.note_extend(self.text.len());
+            } else {
+                self.stream_fade.note_replace();
+            }
         }
 
         self.text.clear();
@@ -291,13 +324,40 @@ impl TextViewState {
         self.increment_update(text, false, cx);
     }
 
+    /// [`Self::set_text`] for the text a `TextView` element hands over every
+    /// frame: the string it handed over last time (the same allocation, not
+    /// merely equal bytes) is recognized without a comparison, as long as the
+    /// state still holds a text of its length.
+    pub(super) fn set_element_text(&mut self, text: &SharedString, cx: &mut Context<Self>) {
+        let same_string = self.element_text.as_ref().is_some_and(|current| {
+            current.as_ptr() == text.as_ptr() && current.len() == text.len()
+        });
+        if same_string && self.text.len() == text.len() {
+            return;
+        }
+        self.element_text = Some(text.clone());
+        self.set_text(text, cx);
+    }
+
     /// Append partial text content to the existing text.
     pub fn push_str(&mut self, new_text: &str, cx: &mut Context<Self>) {
         if new_text.is_empty() {
             return;
         }
+        self.stream_fade.note_extend(self.text.len());
         self.text.push_str(new_text);
         self.increment_update(new_text, true, cx);
+    }
+
+    /// Set the motion policy; see [`TextViewMotion`].
+    pub fn motion(mut self, motion: TextViewMotion) -> Self {
+        self.set_motion(motion);
+        self
+    }
+
+    /// Set the motion policy; see [`TextViewMotion`].
+    pub fn set_motion(&mut self, motion: TextViewMotion) {
+        self.stream_fade.set_motion(motion);
     }
 
     pub(crate) fn set_markdown_extensions(
@@ -322,6 +382,26 @@ impl TextViewState {
     /// Return the selected text, in the view's [`SelectionFormat`].
     pub fn selected_text(&self) -> String {
         self.selected_text_in(None)
+    }
+
+    /// Return the original Markdown source byte range corresponding to the
+    /// rendered selection.
+    ///
+    /// The range addresses the source passed to this Markdown TextView. It is
+    /// derived from parser positions retained by the rendered inline nodes, so
+    /// identical rendered text maps to the occurrence that was actually
+    /// selected. The result is one contiguous source range, so it includes any
+    /// Markdown delimiters between the selected rendered endpoints. HTML views
+    /// and selections without an exact source mapping return `None`. Select-all
+    /// in a Markdown view returns the full source range.
+    pub fn selected_source_range(&self) -> Option<Range<usize>> {
+        if self.format != TextViewFormat::Markdown {
+            return None;
+        }
+        if self.select_all {
+            return Some(0..self.source().len());
+        }
+        self.parsed_content.document.selected_source_range()
     }
 
     /// The format to copy in, which is [`SelectionFormat::Plain`] whenever the
@@ -392,6 +472,18 @@ impl TextViewState {
         }
     }
 
+    /// Remeasure inline resources after their prepared content or metrics change.
+    ///
+    /// Call from the resource owner's completion handler, through a weak entity
+    /// when the task can outlive this view. This does not reparse the document.
+    /// Existing logical selection is retained until the next selection gesture.
+    pub fn invalidate_inline_layout(&mut self, cx: &mut Context<Self>) {
+        self.preserve_inline_selection = true;
+        self.compatible_layout_update = true;
+        self.invalidate_measured_heights();
+        cx.notify();
+    }
+
     fn increment_update(&mut self, text: &str, append: bool, cx: &mut Context<Self>) {
         self.revision += 1;
         if !append {
@@ -418,6 +510,11 @@ impl TextViewState {
         if parse_synchronously {
             match parse_content(self.format, ParsedContent::default(), &update_options) {
                 Ok(content) => {
+                    self.stream_fade.record(
+                        &self.parsed_content.document,
+                        &content.document,
+                        Instant::now(),
+                    );
                     self.parsed_content = content;
                     self.parsed_error = None;
                     self.invalidate_measured_heights();
@@ -426,6 +523,7 @@ impl TextViewState {
                     }
                 }
                 Err(err) => {
+                    self.stream_fade.discard_pending();
                     self.parsed_error = Some(err);
                 }
             }
@@ -504,6 +602,7 @@ impl TextViewState {
     }
 
     pub(super) fn reset_selection(&mut self) {
+        self.preserve_inline_selection = false;
         self.multi_click_selection = None;
         self.selected_text_override = None;
         self.select_all = false;
@@ -552,14 +651,33 @@ impl TextViewState {
         selected_text: String,
         cx: &mut App,
     ) {
+        self.preserve_inline_selection = false;
         let scroll_offset = self.scroll_offset();
         let pos = pos - self.bounds.origin - scroll_offset;
-        self.multi_click_selection = Some(TextViewMultiClickSelection { pos, kind });
+        self.multi_click_selection = Some(TextViewMultiClickSelection {
+            pos,
+            kind,
+            line_bounds: None,
+        });
         self.selected_text_override = Some(selected_text);
         self.select_all = false;
         self.is_selecting = false;
         self.auto_scroll.stop();
         self.selection_adapter.set_local_selection(true, cx);
+    }
+
+    pub(crate) fn set_multi_click_line(&mut self, bounds: Bounds<Pixels>, cx: &mut App) {
+        self.set_multi_click_selection(
+            bounds.center(),
+            TextViewMultiClickKind::Line,
+            String::new(),
+            cx,
+        );
+        self.selected_text_override = None;
+        let offset = self.bounds.origin + self.scroll_offset();
+        if let Some(selection) = self.multi_click_selection.as_mut() {
+            selection.line_bounds = Some(Bounds::new(bounds.origin - offset, bounds.size));
+        }
     }
 
     pub(super) fn set_auto_scroll(&mut self, delta: Option<Pixels>, cx: &mut Context<Self>) {
@@ -612,7 +730,17 @@ impl TextViewState {
         let scroll_offset = self.scroll_offset();
         self.multi_click_selection.map(|selection| {
             let pos = selection.pos + scroll_offset + self.bounds.origin;
-            TextViewMultiClickSelection { pos, ..selection }
+            let line_bounds = selection.line_bounds.map(|bounds| {
+                Bounds::new(
+                    bounds.origin + scroll_offset + self.bounds.origin,
+                    bounds.size,
+                )
+            });
+            TextViewMultiClickSelection {
+                pos,
+                line_bounds,
+                ..selection
+            }
         })
     }
 }
@@ -621,34 +749,57 @@ impl TextViewState {
 pub(crate) struct TextViewMultiClickSelection {
     pub(crate) pos: Point<Pixels>,
     pub(crate) kind: TextViewMultiClickKind,
+    pub(crate) line_bounds: Option<Bounds<Pixels>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TextViewMultiClickKind {
     Word,
     Paragraph,
+    Line,
 }
 
 impl Render for TextViewState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let typography = (window.text_style(), window.rem_size());
+        if self
+            .layout_text_style
+            .as_ref()
+            .is_some_and(|previous| previous != &typography)
+        {
+            // ListState invalidates its cached rows for width changes, but does
+            // not know that an inherited font or rem change affects offscreen
+            // inline metrics. Retain logical selections just as for resources.
+            self.preserve_inline_selection = true;
+            self.compatible_layout_update = true;
+            self.invalidate_measured_heights();
+        }
+        self.layout_text_style = Some(typography);
         let state = cx.entity();
-        let document = self.parsed_content.document.clone();
-        let mut node_cx = self.parsed_content.node_cx.clone();
-
-        node_cx.code_block_actions = self.code_block_actions.clone();
-        node_cx.code_block_highlighter = self.code_block_highlighter.clone();
-        node_cx.table_actions = self.table_actions.clone();
-        node_cx.link_click_handler = self.link_click_handler.clone();
-        node_cx.markdown_extensions = self.markdown_extensions.clone();
-        node_cx.style = self.text_view_style.clone();
+        let stream_fade = self.stream_fade.frame(Instant::now(), cx.reduce_motion());
+        if stream_fade.is_some() {
+            window.request_animation_frame();
+        }
+        // Built every frame, so everything in it is shared, not copied.
+        let node_cx = NodeContext {
+            offset: self.parsed_content.node_cx.offset,
+            link_refs: self.parsed_content.node_cx.link_refs.clone(),
+            style: self.text_view_style.clone(),
+            code_block_actions: self.code_block_actions.clone(),
+            code_block_highlighter: self.code_block_highlighter.clone(),
+            table_actions: self.table_actions.clone(),
+            link_click_handler: self.link_click_handler.clone(),
+            markdown_extensions: self.markdown_extensions.clone(),
+            stream_fade,
+        };
 
         v_flex()
             .w_full()
             // Clamped content must keep its natural height: stretching it to
             // the capped box would hide the overflow the clamp has to measure.
             .when(self.max_lines.is_none(), |this| this.h_full())
-            .map(|this| match &mut self.parsed_error {
-                None => this.child(document.render_root(
+            .map(|this| match &self.parsed_error {
+                None => this.child(self.parsed_content.document.render_root(
                     if self.scrollable {
                         Some(self.list_state.clone())
                     } else {
@@ -875,8 +1026,207 @@ fn parse_content(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::text::MarkdownNode;
+    use crate::text::{MarkdownNode, node::BlockNode};
     use gpui::TestAppContext;
+
+    mod stream_fade {
+        use std::{ops::Range, time::Duration};
+
+        use gpui::{Entity, TestAppContext};
+
+        use super::super::*;
+        use crate::{motion::Easing, text::stream_fade::TextLeafKey};
+
+        /// Long enough that a debug test cannot outrun the fade before it
+        /// samples the first frame.
+        const FADE: Duration = Duration::from_secs(10);
+
+        fn fading_state(markdown: &str, cx: &mut TestAppContext) -> Entity<TextViewState> {
+            cx.update(crate::init);
+            let state = cx.update(|cx| {
+                cx.new(|cx| {
+                    TextViewState::markdown(markdown, cx).motion(
+                        TextViewMotion::default()
+                            .with_stream_fade(FADE)
+                            .with_stream_fade_easing(Easing::Linear),
+                    )
+                })
+            });
+            cx.run_until_parked();
+            state
+        }
+
+        /// The fade ranges of `key` sampled right now, or `None` when the
+        /// state has nothing fading.
+        fn fades(
+            state: &Entity<TextViewState>,
+            key: TextLeafKey,
+            cx: &mut TestAppContext,
+        ) -> Option<Vec<Range<usize>>> {
+            state.update(cx, |state, _| {
+                let frame = state.stream_fade.frame(Instant::now(), false)?;
+                let fades = frame.fades(key)?;
+                assert!(
+                    fades.iter().all(|(_, fade_out)| *fade_out > 0.9),
+                    "a fade sampled right after it starts is still transparent: {fades:?}"
+                );
+                Some(fades.iter().map(|(range, _)| range.clone()).collect())
+            })
+        }
+
+        #[gpui::test]
+        fn push_str_fades_only_the_appended_text(cx: &mut TestAppContext) {
+            let state = fading_state("hello", cx);
+            state.update(cx, |state, cx| state.push_str(" world", cx));
+            cx.run_until_parked();
+
+            assert_eq!(fades(&state, TextLeafKey::block(0), cx), Some(vec![5..11]));
+
+            state.update(cx, |state, _| {
+                let later = Instant::now() + FADE + Duration::from_secs(1);
+                assert!(state.stream_fade.frame(later, false).is_none());
+                assert!(state.stream_fade.frame(Instant::now(), false).is_none());
+            });
+        }
+
+        #[gpui::test]
+        fn set_text_extending_the_text_fades_like_push_str(cx: &mut TestAppContext) {
+            let state = fading_state("hello", cx);
+            state.update(cx, |state, cx| state.set_text("hello world", cx));
+            cx.run_until_parked();
+
+            assert_eq!(fades(&state, TextLeafKey::block(0), cx), Some(vec![5..11]));
+        }
+
+        #[gpui::test]
+        fn set_text_replacing_the_text_shows_it_at_once(cx: &mut TestAppContext) {
+            let state = fading_state("hello", cx);
+            state.update(cx, |state, cx| state.push_str(" world", cx));
+            cx.run_until_parked();
+            assert!(fades(&state, TextLeafKey::block(0), cx).is_some());
+
+            state.update(cx, |state, cx| state.set_text("other", cx));
+            cx.run_until_parked();
+
+            assert_eq!(fades(&state, TextLeafKey::block(0), cx), None);
+        }
+
+        #[gpui::test]
+        fn completed_markup_refades_from_the_divergence(cx: &mut TestAppContext) {
+            // The paragraph renders `text` (trailing space trimmed), then
+            // `text **bo` literally.
+            let state = fading_state("text ", cx);
+            state.update(cx, |state, cx| state.push_str("**bo", cx));
+            cx.run_until_parked();
+            assert_eq!(fades(&state, TextLeafKey::block(0), cx), Some(vec![4..9]));
+
+            // `text **bold**` renders `text bold`: the space keeps its fade,
+            // the glyphs from byte 5 on changed and fade again as one run.
+            state.update(cx, |state, cx| state.push_str("ld**", cx));
+            cx.run_until_parked();
+            assert_eq!(
+                fades(&state, TextLeafKey::block(0), cx),
+                Some(vec![4..5, 5..9])
+            );
+        }
+
+        #[gpui::test]
+        fn without_stagger_an_update_fades_as_one_chunk(cx: &mut TestAppContext) {
+            let state = fading_state("hello", cx);
+            state.update(cx, |state, cx| state.push_str(" one two three", cx));
+            cx.run_until_parked();
+
+            assert_eq!(fades(&state, TextLeafKey::block(0), cx), Some(vec![5..19]));
+        }
+
+        #[gpui::test]
+        fn words_of_one_update_start_one_after_another(cx: &mut TestAppContext) {
+            let stagger = Duration::from_millis(100);
+            let state = fading_state("hello", cx);
+            state.update(cx, |state, _| {
+                state.set_motion(
+                    TextViewMotion::default()
+                        .with_stream_fade(FADE)
+                        .with_stream_fade_stagger(stagger)
+                        .with_stream_fade_easing(Easing::Linear),
+                )
+            });
+            state.update(cx, |state, cx| state.push_str(" one two three", cx));
+            cx.run_until_parked();
+
+            state.update(cx, |state, _| {
+                let frame = state
+                    .stream_fade
+                    .frame(Instant::now() + stagger * 3, false)
+                    .expect("words still fading");
+                let fades = frame.fades(TextLeafKey::block(0)).expect("paragraph fades");
+                let ranges: Vec<_> = fades.iter().map(|(range, _)| range.clone()).collect();
+                assert_eq!(ranges, vec![5..10, 10..14, 14..19]);
+                // A later word has faded less, so it is still more transparent.
+                assert!(
+                    fades[0].1 < fades[1].1 && fades[1].1 < fades[2].1,
+                    "{fades:?}"
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn a_new_paragraph_fades_as_a_whole(cx: &mut TestAppContext) {
+            let state = fading_state("first", cx);
+            state.update(cx, |state, cx| state.push_str("\n\nsecond", cx));
+            cx.run_until_parked();
+
+            assert_eq!(fades(&state, TextLeafKey::block(0), cx), None);
+            assert_eq!(fades(&state, TextLeafKey::block(7), cx), Some(vec![0..6]));
+        }
+
+        #[gpui::test]
+        fn code_block_text_fades_by_block(cx: &mut TestAppContext) {
+            let state = fading_state("```rs\nlet", cx);
+            state.update(cx, |state, cx| state.push_str(" x", cx));
+            cx.run_until_parked();
+
+            assert_eq!(fades(&state, TextLeafKey::block(0), cx), Some(vec![3..5]));
+        }
+
+        #[gpui::test]
+        fn table_cells_fade_by_ordinal(cx: &mut TestAppContext) {
+            let state = fading_state("| a | b |\n|---|---|\n| c | d", cx);
+            state.update(cx, |state, cx| state.push_str("e |", cx));
+            cx.run_until_parked();
+
+            assert_eq!(fades(&state, TextLeafKey::table_cell(0, 2), cx), None);
+            assert_eq!(
+                fades(&state, TextLeafKey::table_cell(0, 3), cx),
+                Some(vec![1..2])
+            );
+        }
+
+        #[gpui::test]
+        fn zero_duration_records_nothing(cx: &mut TestAppContext) {
+            cx.update(crate::init);
+            let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown("hello", cx)));
+            cx.run_until_parked();
+            state.update(cx, |state, cx| state.push_str(" world", cx));
+            cx.run_until_parked();
+
+            state.update(cx, |state, _| {
+                assert!(state.stream_fade.frame(Instant::now(), false).is_none());
+            });
+        }
+
+        #[gpui::test]
+        fn reduced_motion_drops_the_fade(cx: &mut TestAppContext) {
+            let state = fading_state("hello", cx);
+            state.update(cx, |state, cx| state.push_str(" world", cx));
+            cx.run_until_parked();
+
+            state.update(cx, |state, _| {
+                assert!(state.stream_fade.frame(Instant::now(), true).is_none());
+                assert!(state.stream_fade.frame(Instant::now(), false).is_none());
+            });
+        }
+    }
 
     #[gpui::test]
     fn small_full_replace_parses_before_background_executor_runs(cx: &mut TestAppContext) {
@@ -931,6 +1281,51 @@ mod tests {
     }
 
     #[gpui::test]
+    fn inline_source_ranges_follow_streamed_tail_reparsing(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown("中文 $a$\n\n尾 $x", cx)));
+        state.update(cx, |state, cx| {
+            let extensions = MarkdownExtensions::default().plugin(
+                crate::text::markdown_ext::TestInlinePlugin::new("test").parse_with(|node, _| {
+                    let markdown::mdast::Node::InlineMath(math) = node else {
+                        return None;
+                    };
+                    Some(super::super::MarkdownNode::new("formula", ()).text(math.value.clone()))
+                }),
+            );
+            state.set_markdown_extensions(Arc::new(extensions), cx);
+        });
+        cx.run_until_parked();
+        state.update(cx, |state, cx| state.push_str("^2$ 后", cx));
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            let source = "中文 $a$\n\n尾 $x^2$ 后";
+            assert_eq!(state.source().as_str(), source);
+            let objects: Vec<_> = state
+                .parsed_content
+                .document
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    let super::super::node::BlockNode::Paragraph(paragraph) = block else {
+                        panic!()
+                    };
+                    paragraph
+                        .children
+                        .iter()
+                        .filter_map(|node| node.custom.as_ref())
+                })
+                .collect();
+            assert_eq!(objects.len(), 2);
+            for (object, markdown) in objects.iter().zip(["$a$", "$x^2$"]) {
+                let start = source.find(markdown).unwrap();
+                assert_eq!(object.source_range(), Some(start..start + markdown.len()));
+                assert_eq!(object.as_markdown(), markdown);
+            }
+        });
+    }
+
+    #[gpui::test]
     fn async_full_replace_then_push_str_preserves_complete_source(cx: &mut TestAppContext) {
         cx.update(crate::init);
         let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown("old", cx)));
@@ -973,6 +1368,33 @@ mod tests {
             assert!(text.contains("first"), "lost the first block: {text:?}");
             assert!(text.contains("second"), "lost the appended block: {text:?}");
         });
+    }
+
+    #[gpui::test]
+    fn element_text_of_the_same_string_is_not_compared_again(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown("", cx)));
+        let revision = |cx: &mut TestAppContext| state.read_with(cx, |state, _| state.revision);
+        let text = SharedString::from("hello");
+
+        state.update(cx, |state, cx| state.set_element_text(&text, cx));
+        let parsed = revision(cx);
+        assert!(parsed > 0);
+
+        // The same allocation again, and equal bytes in another allocation,
+        // both leave the parsed text alone.
+        state.update(cx, |state, cx| state.set_element_text(&text, cx));
+        assert_eq!(revision(cx), parsed);
+        let equal = SharedString::from("hello".to_string());
+        state.update(cx, |state, cx| state.set_element_text(&equal, cx));
+        assert_eq!(revision(cx), parsed);
+
+        // Once the state's text moved on, the element's string is set again.
+        state.update(cx, |state, cx| {
+            state.push_str(" world", cx);
+            state.set_element_text(&equal, cx);
+        });
+        state.read_with(cx, |state, _| assert_eq!(state.text.as_str(), "hello"));
     }
 
     #[gpui::test]
@@ -1169,6 +1591,100 @@ mod tests {
         state.read_with(cx, |state, _| {
             assert_eq!(state.selected_text().trim(), markdown);
         });
+    }
+
+    #[gpui::test]
+    fn selected_source_range_returns_full_markdown_source_for_select_all(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let markdown = "**quick** value";
+        let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown(markdown, cx)));
+        cx.run_until_parked();
+
+        state.update(cx, |state, cx| state.select_all(cx));
+
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.selected_source_range(), Some(0..markdown.len()));
+        });
+    }
+
+    #[gpui::test]
+    fn selected_source_range_returns_none_for_html(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let state = cx.update(|cx| cx.new(|cx| TextViewState::html("<b>quick</b>", cx)));
+        cx.run_until_parked();
+
+        state.update(cx, |state, cx| state.select_all(cx));
+
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.selected_source_range(), None);
+        });
+    }
+
+    #[test]
+    fn selected_source_range_keeps_global_offsets_after_incremental_tail_parse() {
+        let options = UpdateOptions {
+            revision: 1,
+            pending_text: "first\n\nsecond".to_string(),
+            append: false,
+            mode: ParseMode::Replace,
+            markdown_extensions: Arc::default(),
+        };
+        let content = parse_content(TextViewFormat::Markdown, ParsedContent::default(), &options)
+            .expect("initial parse");
+        let content = parse_content(
+            TextViewFormat::Markdown,
+            content,
+            &UpdateOptions {
+                revision: 2,
+                pending_text: "\n\n**écho**".to_string(),
+                append: true,
+                mode: ParseMode::Compatible,
+                markdown_extensions: Arc::default(),
+            },
+        )
+        .expect("incremental parse");
+        let BlockNode::Paragraph(paragraph) = &content.document.blocks[2] else {
+            panic!("expected appended paragraph");
+        };
+        let mut state = paragraph.state.lock().unwrap();
+        state.set_text(paragraph.text().into());
+        state.selection = Some((0.."écho".len()).into());
+        drop(state);
+
+        assert_eq!(content.document.selected_source_range(), Some(17..22));
+    }
+
+    #[gpui::test]
+    fn parser_revision_reparses_same_name_inline_configuration(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown("@member", cx)));
+        for (revision, label) in [(1, "Alice"), (2, "Bob")] {
+            let extensions = MarkdownExtensions::default()
+                .parser_revision(revision)
+                .plugin(
+                    crate::text::markdown_ext::TestInlinePlugin::new("test").parse_with(
+                        move |node, _| {
+                            matches!(node, markdown::mdast::Node::Text(_))
+                                .then(|| MarkdownNode::new("mention", label).text(label))
+                        },
+                    ),
+                );
+            state.update(cx, |state, cx| {
+                state.set_markdown_extensions(Arc::new(extensions), cx)
+            });
+            cx.run_until_parked();
+            state.read_with(cx, |state, _| {
+                let node::BlockNode::Paragraph(paragraph) =
+                    &state.parsed_content.document.blocks[0]
+                else {
+                    panic!()
+                };
+                assert_eq!(
+                    paragraph.children[0].custom.as_ref().unwrap().as_text(),
+                    label
+                );
+            });
+        }
     }
 
     #[gpui::test]

@@ -3,10 +3,10 @@ use std::{cell::Cell, rc::Rc};
 use gpui::{
     Anchor, AnyElement, App, Bounds, Div, ElementId, InteractiveElement, Interactivity,
     IntoElement, ParentElement, Pixels, Point, RenderOnce, StatefulInteractiveElement,
-    StyleRefinement, Styled, Window, deferred, div, px,
+    StyleRefinement, Styled, Window, canvas, deferred, div, point, px,
 };
 
-use crate::{Align, ElementExt as _, Placement, Positioner, StyledExt as _};
+use crate::{Positioner, ResolvedPosition, StyledExt as _};
 
 /// Distance kept between a popup and the window edge.
 const WINDOW_MARGIN: Pixels = px(8.);
@@ -31,11 +31,8 @@ pub struct Popup {
     base: gpui::Stateful<Div>,
     style: StyleRefinement,
     anchor: Anchor,
-    placement: Option<Placement>,
-    align: Align,
     offset: Pixels,
-    margin: Pixels,
-    priority: usize,
+    on_position: Option<Box<dyn Fn(ResolvedPosition, Bounds<Pixels>)>>,
     trigger: AnyElement,
     content: Option<AnyElement>,
 }
@@ -48,11 +45,8 @@ impl Popup {
             id,
             style: StyleRefinement::default(),
             anchor: Anchor::TopLeft,
-            placement: None,
-            align: Align::Center,
             offset: px(0.),
-            margin: WINDOW_MARGIN,
-            priority: POPUP_PRIORITY,
+            on_position: None,
             trigger: trigger.into_any_element(),
             content: None,
         }
@@ -63,35 +57,18 @@ impl Popup {
         self
     }
 
-    /// Places the popup on a side of its trigger, with viewport-aware flipping.
-    ///
-    /// This takes precedence over [`Popup::anchor`].
-    pub fn placement(mut self, placement: Placement) -> Self {
-        self.placement = Some(placement);
-        self
-    }
-
-    /// Sets the popup alignment along its selected side.
-    pub fn align(mut self, align: Align) -> Self {
-        self.align = align;
-        self
-    }
-
-    /// Sets the gap between the trigger and a side-positioned popup.
+    /// Gap from the trigger along the anchor's outward direction, zero by default.
     pub fn offset(mut self, offset: Pixels) -> Self {
         self.offset = offset;
         self
     }
 
-    /// Sets the minimum distance kept between the popup and the window edge.
-    pub fn margin(mut self, margin: Pixels) -> Self {
-        self.margin = margin;
-        self
-    }
-
-    /// Sets the deferred paint priority for the popup surface.
-    pub fn priority(mut self, priority: usize) -> Self {
-        self.priority = priority;
+    /// Observe resolved popup and trigger bounds before content prepaint.
+    pub fn on_position(
+        mut self,
+        callback: impl Fn(ResolvedPosition, Bounds<Pixels>) + 'static,
+    ) -> Self {
+        self.on_position = Some(Box::new(callback));
         self
     }
 
@@ -122,6 +99,20 @@ impl Popup {
     }
 }
 
+/// Match the popup's anchor to the opposite edge of the measured trigger.
+fn anchor_position(anchor: Anchor, trigger: Bounds<Pixels>, offset: Pixels) -> Point<Pixels> {
+    match anchor {
+        Anchor::TopLeft => trigger.bottom_left() + point(px(0.), offset),
+        Anchor::TopCenter => trigger.bottom_center() + point(px(0.), offset),
+        Anchor::TopRight => trigger.bottom_right() + point(px(0.), offset),
+        Anchor::BottomLeft => trigger.origin - point(px(0.), offset),
+        Anchor::BottomCenter => trigger.top_center() - point(px(0.), offset),
+        Anchor::BottomRight => trigger.top_right() - point(px(0.), offset),
+        Anchor::LeftCenter => trigger.right_center() + point(offset, px(0.)),
+        Anchor::RightCenter => trigger.left_center() - point(offset, px(0.)),
+    }
+}
+
 impl Styled for Popup {
     fn style(&mut self) -> &mut StyleRefinement {
         &mut self.style
@@ -141,30 +132,44 @@ impl RenderOnce for Popup {
         let state =
             window.use_keyed_state((self.id, "anchor"), cx, |_, _| PopupAnchorState::default());
         let anchor = self.anchor;
-        let position = Rc::new(Cell::new(Self::resolved_corner(
+        let trigger_bounds = Rc::new(Cell::new(state.read(cx).bounds));
+        let offset = self.offset;
+        let position = Rc::new(Cell::new(anchor_position(
             anchor,
             state.read(cx).bounds,
+            offset,
         )));
 
         let root = self
             .base
             .child(self.trigger)
-            .on_prepaint({
-                let state = state.clone();
-                let position = position.clone();
-                move |bounds, window, cx| {
-                    position.set(Self::resolved_corner(anchor, bounds));
-                    let first = state.update(cx, |state, _| {
-                        let first = !state.captured;
-                        state.bounds = bounds;
-                        state.captured = true;
-                        first
-                    });
-                    if first {
-                        window.request_animation_frame();
-                    }
-                }
-            })
+            .child(
+                canvas(
+                    {
+                        let state = state.clone();
+                        let position = position.clone();
+                        let trigger_bounds = trigger_bounds.clone();
+                        move |bounds, window, cx| {
+                            trigger_bounds.set(bounds);
+                            position.set(anchor_position(anchor, bounds, offset));
+                            let first = state.update(cx, |state, _| {
+                                let first = !state.captured;
+                                state.bounds = bounds;
+                                state.captured = true;
+                                first
+                            });
+                            if first {
+                                window.request_animation_frame();
+                            }
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+                .top_0()
+                .left_0(),
+            )
             .refine_style(&self.style);
 
         let Some(content) = self.content else {
@@ -174,31 +179,23 @@ impl RenderOnce for Popup {
             return root;
         }
 
-        let positioner = if let Some(placement) = self.placement {
-            let mut trigger_bounds = state.read(cx).bounds;
-            // Popup's prepaint callback receives the legacy anchored-element convention: the
-            // origin is the trigger's bottom-left corner, while Positioner::side expects an
-            // ordinary top-left Bounds. Normalize once here so side placement can share the
-            // existing trigger capture without adding a second measurement element.
-            trigger_bounds.origin.y -= trigger_bounds.size.height;
-            Positioner::side(trigger_bounds)
-                .placement(placement)
-                .align(self.align)
-                .offset(self.offset)
+        let positioner =
+            Positioner::corner(anchor, position.get()).tracked_corner_position(position);
+        let positioner = if let Some(callback) = self.on_position {
+            positioner.on_position(move |position| callback(position, trigger_bounds.get()))
         } else {
-            Positioner::corner(anchor, position.get())
+            positioner
         };
-
         root.child(
             deferred(
                 positioner
-                    .margin(self.margin)
+                    .margin(WINDOW_MARGIN)
                     // The host blocks the mouse, so no caller has to remember:
                     // what a popup covers belongs to the popup.
                     .occlude()
                     .child(content),
             )
-            .with_priority(self.priority),
+            .with_priority(POPUP_PRIORITY),
         )
     }
 }
@@ -224,27 +221,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn side_positioning_options_are_configurable_without_changing_defaults() {
-        let popup = Popup::new("popup", div())
-            .placement(Placement::Bottom)
-            .align(Align::Start)
-            .offset(px(6.))
-            .margin(px(12.))
-            .priority(321);
-
-        assert_eq!(popup.placement, Some(Placement::Bottom));
-        assert_eq!(popup.align, Align::Start);
-        assert_eq!(popup.offset, px(6.));
-        assert_eq!(popup.margin, px(12.));
-        assert_eq!(popup.priority, 321);
-
-        let defaults = Popup::new("defaults", div());
-        assert_eq!(defaults.placement, None);
-        assert_eq!(defaults.margin, WINDOW_MARGIN);
-        assert_eq!(defaults.priority, POPUP_PRIORITY);
-    }
-
     struct Harness;
 
     impl Render for Harness {
@@ -261,40 +237,6 @@ mod tests {
                     .size(px(20.)),
             )
         }
-    }
-
-    struct SidePlacementHarness;
-
-    impl Render for SidePlacementHarness {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            Popup::new(
-                "side-popup",
-                div()
-                    .debug_selector(|| "side-popup-trigger".into())
-                    .size(px(100.)),
-            )
-            .placement(Placement::Bottom)
-            .align(Align::Start)
-            .offset(px(8.))
-            .content(
-                div()
-                    .debug_selector(|| "side-popup-content".into())
-                    .size(px(20.)),
-            )
-        }
-    }
-
-    #[gpui::test]
-    fn side_positioning_starts_after_the_trigger_bounds(cx: &mut gpui::TestAppContext) {
-        let (_, window) = cx.add_window_view(|_, _| SidePlacementHarness);
-        window.update(|window, cx| window.draw(cx).clear(cx));
-        window.update(|window, cx| window.draw(cx).clear(cx));
-
-        let trigger = window.debug_bounds("side-popup-trigger").unwrap();
-        let content = window.debug_bounds("side-popup-content").unwrap();
-
-        assert_eq!(content.left(), WINDOW_MARGIN);
-        assert_eq!(content.top(), trigger.bottom() + px(8.));
     }
 
     /// A caller that styles its own surface — a hover card, a dropdown — does

@@ -1,7 +1,7 @@
 ---
 title: FPS Monitor
 description: Read the gpui-fps HUD — what MAX FPS is, why it is derived rather than counted, and what each row measures.
-order: -5
+order: -15
 ---
 
 # FPS Monitor
@@ -97,9 +97,10 @@ to a guess: a ceiling under the truth hides the figure the reader came for.
 | `CPU` | This process, on the scale `top` and Activity Monitor use: 100 is one saturated core, so a process spread across a core and a half reads 140. |
 | `MEM` | Resident set. |
 
-`FRAME`, `P95` and `DROP` are graded against the budget set by
-`frame_budget()`, which defaults to one 60Hz frame. Set it to `1/144s` on a
-high refresh rate display, or the chart will grade healthy frames amber.
+`FRAME`, `P95` and `DROP` are graded against the frame budget: one refresh of
+the display the window is on, where the platform reports the rate above, and
+one 60Hz frame where it does not. `frame_budget()` pins a budget of your own
+instead, and the display then no longer replaces it.
 
 ## The first frames are not measured
 
@@ -120,5 +121,18 @@ One frame every 500ms. It does not drive the frame loop, but it does need a
 clock — nothing else would wake a HUD in a window that has stopped drawing, and
 the figures would freeze at whatever the application last drew. That clock also
 carries the CPU, GPU and memory sample.
+
+Those frames are not measured. To GPUI the clock's `notify` is an invalidation
+like any other, answered with a full draw of the window, and left in the
+readings it would be a cold frame every 500ms reported as the application's
+`FRAME` and `MAX`. So the clock announces each one, and the sampler leaves out
+the draw that answered it — unless the application asked for that frame too, in
+which case the work was wanted and the cost counts.
+
+Hidden, the HUD costs nothing. Two ticks without being rendered — a second —
+and the clock stops, the resource probe with it, and the HUD lets go of GPUI's
+frame trace unless something else is holding it. The next render starts it all
+again from an empty sampler: the trace buffer was cleared with the switch, and
+the frames the window drew meanwhile were nobody's to report.
 
 [`Entity::cached`]: https://docs.rs/gpui/latest/gpui/struct.Entity.html

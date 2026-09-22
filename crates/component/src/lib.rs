@@ -13,6 +13,7 @@ mod sizing;
 mod styled;
 mod time;
 mod title_bar;
+mod touch_selection;
 mod virtual_list;
 mod window_border;
 mod window_ext;
@@ -29,6 +30,7 @@ pub mod badge;
 pub mod breadcrumb;
 pub mod bubble;
 pub mod button;
+pub mod carousel;
 pub mod chart;
 pub mod checkbox;
 pub mod clipboard;
@@ -39,6 +41,7 @@ pub mod command;
 pub mod description_list;
 pub mod dialog;
 pub mod dock;
+pub mod empty;
 pub mod form;
 pub mod group_box;
 pub mod highlighter;
@@ -59,15 +62,10 @@ pub mod pagination;
 pub mod plot;
 pub mod popover;
 pub mod progress;
+pub mod questionnaire;
 pub mod radio;
 pub mod rating;
-/// Backwards-compatible resizable component paths.
-pub mod resizable {
-    pub use super::{
-        ResizablePanel, ResizablePanelEvent, ResizablePanelGroup, ResizableState, h_resizable,
-        resizable_panel, v_resizable,
-    };
-}
+pub mod resizable;
 pub mod scroll;
 pub mod searchable_list;
 pub mod select;
@@ -87,12 +85,14 @@ pub mod table;
 pub mod tag;
 pub mod text;
 pub mod theme;
+pub mod toolbar;
 pub mod tooltip;
 pub mod tree;
 
 pub use crate::Disableable;
 pub use element_ext::*;
 pub use global_state::GlobalState;
+pub use gpui_base::Root;
 pub use gpui_base::animation;
 pub(crate) use gpui_base::measurement_enabled as measure_enable;
 #[doc(hidden)]
@@ -101,17 +101,16 @@ pub use gpui_base::{
     AxisExt, Edges, FocusTrapElement, InteractiveElementExt, LengthExt, Measure, OngoingScrollExt,
     Placement, Side, measure, measure_if,
 };
-pub use gpui_base::{
-    ResizablePanel, ResizablePanelEvent, ResizablePanelGroup, ResizableState, h_resizable,
-    resizable_panel, v_resizable,
-};
 pub use gpui_component_macros::icon_named;
 pub use icon::*;
 pub use index_path::IndexPath;
 pub use input::{Rope, RopeExt, RopeLines};
 #[cfg(any(feature = "inspector", debug_assertions))]
 pub use inspector::*;
-pub use root::Root;
+pub use resizable::{
+    ResizablePanel, ResizablePanelEvent, ResizablePanelGroup, ResizableState, h_resizable,
+    resizable_panel, resize_handle_appearance, v_resizable,
+};
 pub use styled::*;
 pub use theme::*;
 pub use time::{calendar, date_picker};
@@ -138,8 +137,10 @@ pub fn init(cx: &mut App) {
     sheet::init(cx);
     list::init(cx);
     command::init(cx);
+    carousel::init(cx);
     notification::init(cx);
     popover::init(cx);
+    questionnaire::init(cx);
     menu::init(cx);
     table::init(cx);
     tooltip::init(cx);

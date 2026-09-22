@@ -116,7 +116,7 @@ mod tests {
     }
 }
 
-fn take_element<T: gpui::IntoElement + 'static>(
+pub(super) fn take_element<T: gpui::IntoElement + 'static>(
     element: &mut gpui::AnyElement,
     name: &str,
 ) -> anyhow::Result<T> {
@@ -127,12 +127,12 @@ fn take_element<T: gpui::IntoElement + 'static>(
         .ok_or_else(|| anyhow::anyhow!("registered {name} child was already consumed"))
 }
 
-struct TypedChildElement<T: gpui::IntoElement + 'static> {
+pub(super) struct TypedChildElement<T: gpui::IntoElement + 'static> {
     value: Option<T>,
 }
 
 impl<T: gpui::IntoElement + 'static> TypedChildElement<T> {
-    fn new(value: T) -> Self {
+    pub(super) fn new(value: T) -> Self {
         Self { value: Some(value) }
     }
 
@@ -211,6 +211,26 @@ where
 {
     element.style().refine(&request.take_style());
     element.extend(request.take_children()?);
+    Ok(TypedChildElement::new(element).into_any_element())
+}
+
+pub(super) fn finish_typed_children<E>(
+    request: &mut MaterializeRequest<'_>,
+    mut element: E,
+    parent: &str,
+    allowed: &[&str],
+) -> anyhow::Result<gpui::AnyElement>
+where
+    E: gpui::Styled + gpui::ParentElement + gpui::IntoElement + 'static,
+{
+    let mut children = request.take_typed_children()?;
+    for child in &children {
+        require_child(parent, child.component_name(), allowed)?;
+    }
+    for child in &mut children {
+        element.extend([request.materialize_child(child)?]);
+    }
+    element.style().refine(&request.take_style());
     Ok(TypedChildElement::new(element).into_any_element())
 }
 

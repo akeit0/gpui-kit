@@ -25,17 +25,19 @@ use anyhow::{Context as _, Result, anyhow};
 use gpui::{App, AppContext as _, ClickEvent, Entity, Global, Subscription, WeakEntity, Window};
 use rquickjs::{
     Array, Context as JsContext, Ctx, Error as JsError, Exception, FromJs, Function, Object,
-    Persistent, Result as JsResult, Runtime as JsRuntime, Value,
+    Persistent, Result as JsResult, Value,
     function::{Args as JsArgs, Func, Opt, This},
     loader::{BuiltinResolver, ImportAttributes, Loader, ModuleLoader, Resolver},
     module::Declared,
     module::{Declarations, Exports, Module, ModuleDef},
 };
+use rquickjs_jit::{JitConfig, JitRuntime};
 use smallvec::SmallVec;
 
 use crate::{
     ArgumentDescriptor, ArgumentSchema, ComponentArgument, ComponentCallbackArgument,
     ComponentCallbackValue, ComponentDataValue, ComponentPayload, FrozenComponentRegistry,
+    capability::is_openable_url,
     dependencies::{GitDependencyStore, MaterializedDependency},
     entities::{EntityHandle, EntityStore},
     host_modules::HostValue,
@@ -237,6 +239,27 @@ mod retained_component_state_tests {
                 .to_string()
                 .contains("cannot be updated during render")
         );
+    }
+}
+
+#[cfg(test)]
+mod jit_suspension_tests {
+    use super::*;
+
+    #[test]
+    fn nested_suspension_preserves_the_outer_state() {
+        let runtime = ShellRuntime::new_isolated().unwrap();
+
+        runtime
+            .with_jit_suspended(|| {
+                assert!(runtime.js_runtime.jit().is_suspended());
+                runtime.with_jit_suspended(|| Ok(()))?;
+                assert!(runtime.js_runtime.jit().is_suspended());
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!runtime.js_runtime.jit().is_suspended());
     }
 }
 
@@ -459,6 +482,77 @@ mod component_callback_value_tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[gpui::test]
+    fn inline_element_callbacks_retire_with_their_element(cx: &mut TestAppContext) {
+        let runtime = ShellRuntime::new_isolated().unwrap();
+        let (good, _) = callback(
+            &runtime,
+            r#"() => __gpui.Button.new("child").on_click(() => {})"#,
+            None,
+        );
+        let (bad, _) = callback(
+            &runtime,
+            r#"() => { __gpui.Button.new("child").on_click(() => {}); throw new Error("failed render"); }"#,
+            None,
+        );
+        let good = crate::ComponentElementCallback::from_runtime(&runtime, good);
+        let bad = crate::ComponentElementCallback::from_runtime(&runtime, bad);
+        let baseline = runtime.callbacks.borrow().len();
+        struct Probe {
+            renderer: Option<crate::ComponentElementCallback>,
+            failed: bool,
+        }
+        impl gpui::Render for Probe {
+            fn render(
+                &mut self,
+                window: &mut Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                use gpui::IntoElement as _;
+                let Some(renderer) = &self.renderer else {
+                    return gpui::div().into_any_element();
+                };
+                match renderer.build_interactive_data_with(&[], window, cx) {
+                    Ok(Some(element)) => element,
+                    result => {
+                        self.failed = result.is_err();
+                        gpui::div().into_any_element()
+                    }
+                }
+            }
+        }
+        let window = cx.add_window(|_, _| Probe {
+            renderer: None,
+            failed: false,
+        });
+        let mut context = VisualTestContext::from_window(*window.deref(), cx);
+        let probe = window.root(&mut context).unwrap();
+        for _ in 0..8 {
+            probe.update(&mut context, |probe, cx| {
+                probe.renderer = Some(good.clone());
+                cx.notify();
+            });
+            context.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(runtime.callbacks.borrow().len(), baseline + 1);
+            probe.update(&mut context, |probe, cx| {
+                probe.renderer = None;
+                cx.notify();
+            });
+            // The previous frame's event table also owns the lease.
+            context.update(|window, cx| window.draw(cx).clear(cx));
+            context.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(runtime.callbacks.borrow().len(), baseline);
+            probe.update(&mut context, |probe, cx| {
+                probe.renderer = Some(bad.clone());
+                cx.notify();
+            });
+            context.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(context.update(|_, cx| probe.read(cx).failed));
+            assert_eq!(runtime.callbacks.borrow().len(), baseline);
+            assert!(!runtime.interactive_inline_layout.get());
+        }
     }
 
     #[gpui::test]
@@ -830,6 +924,7 @@ pub struct ViewObject {
     #[allow(dead_code)] // Its drop owns the resolver registration lifetime.
     module_lease: Option<ApplicationModuleLease>,
     application: Option<Rc<ApplicationGeneration>>,
+    jit_warm: Rc<Cell<bool>>,
 }
 
 impl std::fmt::Debug for ViewObject {
@@ -844,6 +939,7 @@ impl ViewObject {
             value,
             module_lease: None,
             application: None,
+            jit_warm: Rc::new(Cell::new(false)),
         }
     }
 
@@ -1270,6 +1366,7 @@ pub struct ShellRuntime {
     callbacks: RefCell<CallbackArena<Persistent<Function<'static>>>>,
     components: FrozenComponentRegistry,
     component_state_proof: String,
+    interactive_inline_layout: Cell<bool>,
     component_states: RefCell<crate::component_registry::RetainedStateStore>,
     pending_component_state_releases: RefCell<Vec<Rc<ApplicationGeneration>>>,
     component_app_effects: RefCell<HashMap<usize, ComponentAppEffectGeneration>>,
@@ -1345,7 +1442,38 @@ pub struct ShellRuntime {
     next_application_generation: Cell<u64>,
     /// Held so the context stays alive, and so the module loader can be scoped
     /// to an application directory when one is loaded.
-    js_runtime: JsRuntime,
+    js_runtime: JitRuntime,
+}
+
+struct JitSuspension<'a> {
+    jit: &'a rquickjs_jit::Jit,
+    active: bool,
+}
+
+impl JitSuspension<'_> {
+    fn begin(jit: &rquickjs_jit::Jit) -> Result<JitSuspension<'_>> {
+        let active = !jit.is_suspended();
+        if active {
+            jit.suspend()?;
+        }
+        Ok(JitSuspension { jit, active })
+    }
+
+    fn finish(mut self) -> Result<()> {
+        if self.active {
+            self.jit.resume()?;
+        }
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for JitSuspension<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.jit.resume();
+        }
+    }
 }
 
 impl Drop for ShellRuntime {
@@ -1379,6 +1507,17 @@ struct RuntimeGlobal(Weak<ShellRuntime>);
 impl Global for RuntimeGlobal {}
 
 impl ShellRuntime {
+    fn with_jit_suspended<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        if !self.js_runtime.has_jit() {
+            return operation();
+        }
+        let jit = self.js_runtime.jit();
+        let suspension = JitSuspension::begin(jit)?;
+        let result = operation();
+        suspension.finish()?;
+        result
+    }
+
     /// Loads an application's JavaScript entry without exposing engine values.
     ///
     /// Resolution, declaration refresh, module generations, capabilities and
@@ -1457,6 +1596,19 @@ impl ShellRuntime {
         Self::new_isolated_with_components_and_dependency_store(
             FrozenComponentRegistry::default(),
             GitDependencyStore::for_user()?,
+            shell_jit_config()?,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_isolated_interpreter() -> Result<Rc<Self>> {
+        let js_runtime = JitRuntime::builder()
+            .build_interpreter()
+            .map_err(|error| anyhow!("failed to start the JavaScript interpreter: {error}"))?;
+        Self::new_isolated_with_components_dependency_store_and_runtime(
+            FrozenComponentRegistry::default(),
+            GitDependencyStore::for_user()?,
+            js_runtime,
         )
     }
 
@@ -1464,6 +1616,7 @@ impl ShellRuntime {
         Self::new_isolated_with_components_and_dependency_store(
             components,
             GitDependencyStore::for_user()?,
+            shell_jit_config()?,
         )
     }
 
@@ -1474,16 +1627,37 @@ impl ShellRuntime {
         Self::new_isolated_with_components_and_dependency_store(
             FrozenComponentRegistry::default(),
             dependency_store,
+            shell_jit_config()?,
         )
     }
 
     fn new_isolated_with_components_and_dependency_store(
         components: FrozenComponentRegistry,
         dependency_store: GitDependencyStore,
+        jit_config: JitConfig,
     ) -> Result<Rc<Self>> {
+        let js_runtime = JitRuntime::builder()
+            .config(jit_config)
+            .build()
+            .map_err(|error| anyhow!("failed to start the JavaScript JIT runtime: {error}"))?;
+        Self::new_isolated_with_components_dependency_store_and_runtime(
+            components,
+            dependency_store,
+            js_runtime,
+        )
+    }
+
+    fn new_isolated_with_components_dependency_store_and_runtime(
+        components: FrozenComponentRegistry,
+        dependency_store: GitDependencyStore,
+        js_runtime: JitRuntime,
+    ) -> Result<Rc<Self>> {
+        let jit_enabled = js_runtime.has_jit();
+        if jit_enabled {
+            js_runtime.jit().suspend()?;
+        }
         let entities = EntityStore::try_new()
             .ok_or_else(|| anyhow!("gpui-shell entity store id space is exhausted"))?;
-        let js_runtime = JsRuntime::new().map_err(js_setup_error)?;
         let context = JsContext::full(&js_runtime).map_err(js_setup_error)?;
 
         let app_modules = AppModules::default();
@@ -1527,6 +1701,7 @@ impl ShellRuntime {
             callbacks: RefCell::new(CallbackArena::default()),
             components,
             component_state_proof,
+            interactive_inline_layout: Cell::new(false),
             component_states: RefCell::new(Default::default()),
             pending_component_state_releases: RefCell::new(Vec::new()),
             component_app_effects: RefCell::new(HashMap::new()),
@@ -1554,7 +1729,11 @@ impl ShellRuntime {
             js_runtime,
         });
 
-        runtime.install_globals()?;
+        let installed = runtime.install_globals();
+        if jit_enabled {
+            runtime.js_runtime.jit().resume()?;
+        }
+        installed?;
         Ok(runtime)
     }
 
@@ -1858,6 +2037,13 @@ impl ShellRuntime {
         self.arena.borrow_mut().reset();
     }
 
+    /// Returns JIT diagnostic counters for the real-process acceptance
+    /// benchmark.
+    #[cfg(test)]
+    pub(crate) fn jit_metrics_for_benchmark(&self) -> rquickjs_jit::JitMetrics {
+        self.js_runtime.metrics()
+    }
+
     /// A reading of the two counters, taken now.
     ///
     /// The host gets the reading rather than the instrument: `Metrics` is the
@@ -2047,21 +2233,24 @@ impl ShellRuntime {
         module_lease: Option<ApplicationModuleLease>,
         application: Option<Rc<ApplicationGeneration>>,
     ) -> Result<ViewType> {
-        self.with_js(|ctx| {
-            let (module, promise) = rquickjs::Module::declare(ctx.clone(), name, source)?.eval()?;
-            promise.finish::<()>()?;
+        self.with_jit_suspended(|| {
+            self.with_js(|ctx| {
+                let (module, promise) =
+                    rquickjs::Module::declare(ctx.clone(), name, source)?.eval()?;
+                promise.finish::<()>()?;
 
-            let default: Value = module.get("default")?;
-            let Some(class) = default.as_object() else {
-                return Err(Exception::throw_message(
-                    ctx,
-                    "main.js must `export default` a class that extends View",
-                ));
-            };
-            Ok(ViewType {
-                value: Persistent::save(ctx, class.clone()),
-                module_lease,
-                application,
+                let default: Value = module.get("default")?;
+                let Some(class) = default.as_object() else {
+                    return Err(Exception::throw_message(
+                        ctx,
+                        "main.js must `export default` a class that extends View",
+                    ));
+                };
+                Ok(ViewType {
+                    value: Persistent::save(ctx, class.clone()),
+                    module_lease,
+                    application,
+                })
             })
         })
     }
@@ -2784,14 +2973,17 @@ impl ShellRuntime {
     }
 
     fn construct(&self, view_type: &ViewType) -> Result<ViewObject> {
-        self.with_js(|ctx| {
-            let class = view_type.value.clone().restore(ctx)?;
-            let construct: Function = ctx.globals().get("__construct")?;
-            let instance: Object = construct.call((class,))?;
-            Ok(ViewObject {
-                value: Persistent::save(ctx, instance),
-                module_lease: view_type.module_lease.clone(),
-                application: view_type.application.clone(),
+        self.with_jit_suspended(|| {
+            self.with_js(|ctx| {
+                let class = view_type.value.clone().restore(ctx)?;
+                let construct: Function = ctx.globals().get("__construct")?;
+                let instance: Object = construct.call((class,))?;
+                Ok(ViewObject {
+                    value: Persistent::save(ctx, instance),
+                    module_lease: view_type.module_lease.clone(),
+                    application: view_type.application.clone(),
+                    jit_warm: Rc::new(Cell::new(false)),
+                })
             })
         })
     }
@@ -2845,14 +3037,16 @@ impl ShellRuntime {
         initial_props: Option<Persistent<Value<'static>>>,
     ) -> Result<()> {
         self.initializing_views.borrow_mut().push(object.clone());
-        let initialized = self.with_js(|ctx| {
-            let instance = object.value.clone().restore(ctx)?;
-            let initialize: Function = ctx.globals().get("__initialize")?;
-            let props = match initial_props {
-                Some(props) => props.restore(ctx)?,
-                None => Value::new_undefined(ctx.clone()),
-            };
-            initialize.call::<_, ()>((instance, props))
+        let initialized = self.with_jit_suspended(|| {
+            self.with_js(|ctx| {
+                let instance = object.value.clone().restore(ctx)?;
+                let initialize: Function = ctx.globals().get("__initialize")?;
+                let props = match initial_props {
+                    Some(props) => props.restore(ctx)?,
+                    None => Value::new_undefined(ctx.clone()),
+                };
+                initialize.call::<_, ()>((instance, props))
+            })
         });
         let initializing = self.initializing_views.borrow_mut().pop();
         debug_assert!(initializing.is_some());
@@ -2903,21 +3097,32 @@ impl ShellRuntime {
         self.arena.borrow_mut().reset();
         let callbacks = self.callbacks.borrow_mut().begin();
 
-        let (root, policy) = self.metrics.time_script_render(|| {
-            let (_guard, generation) = scope::enter_with_application(
-                self,
-                window,
-                cx,
-                ScopePhase::Render,
-                view.clone(),
-                policy.clone(),
-                object.application_generation(),
-            );
-            (self.call_render(object, generation), policy)
-        });
+        let first_render = !object.jit_warm.get();
+        let render = || {
+            self.metrics.time_script_render(|| {
+                let (_guard, generation) = scope::enter_with_application(
+                    self,
+                    window,
+                    cx,
+                    ScopePhase::Render,
+                    view.clone(),
+                    policy.clone(),
+                    object.application_generation(),
+                );
+                (self.call_render(object, generation), policy)
+            })
+        };
+        let (root, policy) = if first_render {
+            self.with_jit_suspended(|| Ok(render()))?
+        } else {
+            render()
+        };
 
         let root = match root {
-            Ok(root) => root,
+            Ok(root) => {
+                object.jit_warm.set(true);
+                root
+            }
             Err(error) => {
                 self.callbacks.borrow_mut().abort();
                 self.arena.borrow_mut().reset();
@@ -4373,6 +4578,25 @@ impl ShellRuntime {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<ComponentCallbackValue> {
+        self.dispatch_component_event(id, EventArguments::Scalar(arguments), window, cx)
+    }
+    pub(crate) fn dispatch_component_event_data(
+        self: &Rc<Self>,
+        id: CallbackId,
+        arguments: &[ComponentDataValue],
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<ComponentCallbackValue> {
+        self.dispatch_component_event(id, EventArguments::Data(arguments), window, cx)
+    }
+
+    fn dispatch_component_event(
+        self: &Rc<Self>,
+        id: CallbackId,
+        arguments: EventArguments<'_>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<ComponentCallbackValue> {
         let entry = self
             .callbacks
             .borrow()
@@ -4406,8 +4630,17 @@ impl ShellRuntime {
         let result = self.with_js(|ctx| {
             let handler = entry.value.clone().restore(ctx)?;
             let mut js_arguments = JsArgs::new(ctx.clone(), arguments.len() + 1);
-            for argument in arguments {
-                js_arguments.push_arg(callback_argument_to_js(ctx, argument)?)?;
+            match arguments {
+                EventArguments::Scalar(values) => {
+                    for value in values {
+                        js_arguments.push_arg(callback_argument_to_js(ctx, value)?)?;
+                    }
+                }
+                EventArguments::Data(values) => {
+                    for value in values {
+                        js_arguments.push_arg(component_data_into_js(ctx, value)?)?;
+                    }
+                }
             }
             js_arguments.push_arg(context_object(ctx, ContextBinding::Call(generation))?)?;
             let value: Value<'_> = handler.call_arg(js_arguments)?;
@@ -4546,6 +4779,17 @@ impl ShellRuntime {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<Option<gpui::AnyElement>> {
+        self.dispatch_inline_element_data(id, arguments, false, window, cx)
+    }
+
+    pub(crate) fn dispatch_inline_element_data(
+        self: &Rc<Self>,
+        id: CallbackId,
+        arguments: &[ComponentDataValue],
+        interactive: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<Option<gpui::AnyElement>> {
         let entry = self
             .callbacks
             .borrow()
@@ -4575,6 +4819,33 @@ impl ShellRuntime {
             );
             scope::adopt(entry.registered_in);
             let temporary = TemporarySpecArena::enter(self);
+            let callback_generation = if interactive {
+                anyhow::ensure!(
+                    !self.callbacks.borrow().is_building(),
+                    "inline renderer cannot nest callback recording"
+                );
+                Some(self.callbacks.borrow_mut().begin())
+            } else {
+                None
+            };
+            struct CallbackGuard<'a> {
+                runtime: &'a ShellRuntime,
+                previous: bool,
+                active: bool,
+            }
+            impl Drop for CallbackGuard<'_> {
+                fn drop(&mut self) {
+                    self.runtime.interactive_inline_layout.set(self.previous);
+                    if self.active {
+                        self.runtime.callbacks.borrow_mut().abort();
+                    }
+                }
+            }
+            let mut callbacks = CallbackGuard {
+                runtime: self,
+                previous: self.interactive_inline_layout.replace(interactive),
+                active: interactive,
+            };
             let described = self.with_js(|ctx| {
                 let handler = entry.value.clone().restore(ctx)?;
                 let mut args = JsArgs::new(ctx.clone(), arguments.len() + 1);
@@ -4592,8 +4863,38 @@ impl ShellRuntime {
             let arena = temporary.finish();
             match described {
                 Ok(Some(root)) => {
-                    crate::materialize::try_materialize_subtree(self, &arena, root, window, cx)
-                        .map(Some)
+                    if let Some(generation) = callback_generation {
+                        self.callbacks.borrow_mut().commit();
+                        callbacks.active = false;
+                        let snapshot = RenderSnapshot::new(
+                            self,
+                            generation,
+                            root,
+                            arena,
+                            entry.application.clone(),
+                            entry.view.clone(),
+                        );
+                        let element = crate::materialize::try_materialize_subtree(
+                            self,
+                            snapshot.arena(),
+                            root,
+                            window,
+                            cx,
+                        )?;
+                        use gpui::{InteractiveElement as _, IntoElement as _, ParentElement as _};
+                        // The frame's event table holds the lease until the next frame replaces it.
+                        Ok(Some(
+                            gpui::div()
+                                .child(element)
+                                .on_mouse_move(move |_, _, _| {
+                                    let _ = &snapshot;
+                                })
+                                .into_any_element(),
+                        ))
+                    } else {
+                        crate::materialize::try_materialize_subtree(self, &arena, root, window, cx)
+                            .map(Some)
+                    }
                 }
                 Ok(None) => Ok(None),
                 Err(error) => Err(error.into()),
@@ -4834,6 +5135,21 @@ impl ShellRuntime {
     fn push_op(&self, id: SpecId, op: SpecOp) -> Result<(), crate::spec::SpecError> {
         self.arena.borrow_mut().push_op(id, op)
     }
+}
+
+fn shell_jit_config() -> Result<JitConfig> {
+    let builder = JitConfig::builder();
+
+    // Debug builds exercise many short-lived runtimes concurrently. Keep them on
+    // the interpreter tier: native compilation currently crashes inside the JIT
+    // backend on Linux and Windows under that workload. Release builds retain the
+    // production thresholds and continue to tier hot functions up to native code.
+    #[cfg(debug_assertions)]
+    let builder = builder.call_threshold(u32::MAX).loop_threshold(u32::MAX);
+
+    builder
+        .build()
+        .map_err(|error| anyhow!("invalid JavaScript JIT configuration: {error}"))
 }
 
 /// Resolves and loads an application's own modules, and nothing else.
@@ -5697,10 +6013,20 @@ globalThis.__gpui = (() => {
 
   // Retained state is held by handle; the methods close over it so nothing has
   // to read it back off `this`.
+  const tokenStateMethods = (handle, invoke) => Object.fromEntries([
+    "content", "tokens", "replace_with_token", "replace_range_with_token",
+    "set_selected_range", "replace"
+  ].map(name => [name, (...args) => invoke(handle, name, args)]));
+  // A value is plain text or a content snapshot with tokens.
+  const setValue = (handle, setText, invoke) => (next) =>
+    next !== null && typeof next === "object"
+      ? invoke(handle, "set_value", [next])
+      : setText(handle, String(next ?? ""));
   const inputState = (handle) => ({
+    ...tokenStateMethods(handle, __input_token_call),
     __handle: handle,
     value: () => __input_value(handle),
-    set_value: (next) => __input_set_value(handle, String(next ?? "")),
+    set_value: setValue(handle, __input_set_value, __input_token_call),
     on: (event, handler) => __input_on(handle, String(event), handler),
     // What makes a text state a number state. There is no `NumberInputState`:
     // the step, the bounds and the mask are fields on this one, so a plain
@@ -5716,9 +6042,10 @@ globalThis.__gpui = (() => {
   // The multi-line state shares almost all of its surface with the single-line
   // one, and adds the three calls that only mean anything once text can wrap.
   const textareaState = (handle) => ({
+    ...tokenStateMethods(handle, __textarea_token_call),
     __handle: handle,
     value: () => __textarea_value(handle),
-    set_value: (next) => __textarea_set_value(handle, String(next ?? "")),
+    set_value: setValue(handle, __textarea_set_value, __textarea_token_call),
     on: (event, handler) => __textarea_on(handle, String(event), handler),
     set_rows: (rows) => __textarea_set_rows(handle, oneBased(rows, "set_rows(rows)")),
     set_auto_grow: (min_rows, max_rows) =>
@@ -5895,7 +6222,7 @@ globalThis.__gpui = (() => {
     const handle = value?.__dock;
     if (typeof handle !== "number") {
       throw new TypeError(
-        api + " expects the group, dock or tile your chrome handler was given as its first argument",
+        api + " expects the group or dock your chrome handler was given as its first argument",
       );
     }
     return handle;
@@ -5906,13 +6233,6 @@ globalThis.__gpui = (() => {
       throw new TypeError(api + " expects a tab group, which is what tab_bar and empty_group are given");
     }
     return group.node;
-  };
-
-  const tilePanel = (tile, api) => {
-    if (typeof tile?.panel?.id !== "number") {
-      throw new TypeError(api + " expects a tile, which is what tile_drag_bar and tile_resize_handles are given");
-    }
-    return tile.panel.id;
   };
 
   // Commands, not callbacks. A chrome handler runs once per frame for as long
@@ -5958,46 +6278,14 @@ globalThis.__gpui = (() => {
     __apply(this.__id, "resize_dock", [dockTarget(dock, api), dockPlacement(dock?.placement, api)]);
     return this;
   };
-  methods.move_tile = function (tile) {
-    const api = "move_tile(tile)";
-    __apply(this.__id, "move_tile", [dockTarget(tile, api), tilePanel(tile, api)]);
-    return this;
-  };
-  methods.resize_tile = function (tile, side) {
-    const api = "resize_tile(tile, side)";
-    const name = String(side ?? "");
-    if (!["left", "right", "top", "bottom", "bottom_right"].includes(name)) {
-      throw new TypeError(api + ' expects "left", "right", "top", "bottom" or "bottom_right"');
-    }
-    __apply(this.__id, "resize_tile", [dockTarget(tile, api), tilePanel(tile, api), name]);
-    return this;
-  };
-  methods.raise_tile = function (tile) {
-    const api = "raise_tile(tile)";
-    __apply(this.__id, "raise_tile", [dockTarget(tile, api), tilePanel(tile, api)]);
-    return this;
-  };
-  methods.toggle_tile_zoom = function (tile) {
-    const api = "toggle_tile_zoom(tile)";
-    __apply(this.__id, "toggle_tile_zoom", [dockTarget(tile, api), tilePanel(tile, api)]);
-    return this;
-  };
-  methods.close_tile = function (tile) {
-    const api = "close_tile(tile)";
-    __apply(this.__id, "close_tile", [dockTarget(tile, api), tilePanel(tile, api)]);
-    return this;
-  };
-
   const DOCK_CHROME = [
     "tab_bar",
     "empty_group",
     "drop_indicator",
     "dock",
-    "tile_drag_bar",
-    "tile_resize_handles",
   ];
 
-  // The six hooks are own properties of the one element that has them, rather
+  // The four hooks are own properties of the one element that has them, rather
   // than prototype methods: every other element in the tree would otherwise
   // carry a `dock` and a `tab_bar` that mean nothing on it.
   const dockAreaElement = (area) => {
@@ -6758,6 +7046,8 @@ impl ShellRuntime {
                 "on_item_click",
                 "on_item_secondary_click",
                 "on_change",
+                "token",
+                "on_token_click",
                 "on_open_change",
                 "on_confirm",
                 "on_dismiss",
@@ -7351,6 +7641,26 @@ impl ShellRuntime {
             ctx.globals()
                 .set("__gpui_components", component_module.clone())?;
             for descriptor in self.components.states() {
+                for method in descriptor.methods() {
+                    let method_runtime = runtime.clone();
+                    let kind = descriptor.kind();
+                    let method = method.clone();
+                    component_module.set(format!("{}.{}", descriptor.export(), method.name()), Func::from(move |ctx: Ctx<'_>, proof: String, handle: u64, arguments: PlainDataArguments| -> JsResult<DataResult> {
+                        let runtime = upgrade(&method_runtime, &ctx)?;
+                        if proof != runtime.component_state_proof { return Err(Exception::throw_type(&ctx, "state belongs to another runtime")); }
+                        if !method.is_readonly() && matches!(scope::current_phase(), Some(ScopePhase::Render | ScopePhase::Layout)) {
+                            return Err(Exception::throw_type(&ctx, "state cannot be changed during render or layout"));
+                        }
+                        runtime.flush_component_state_releases();
+                        let call = {
+                            let store = runtime.component_states.try_borrow().map_err(|_| Exception::throw_type(&ctx, "state registry is already borrowed"))?;
+                            method.prepare(&store, handle, kind, arguments.0).map_err(|e| state_operation_error(&ctx, e))?
+                        };
+                        scope::with_current(move |window, cx| call(window, cx))
+                            .ok_or_else(|| Exception::throw_type(&ctx, "state operation requires a live host call"))?
+                            .map(DataResult).map_err(|e| state_operation_error(&ctx, e))
+                    }))?;
+                }
                 let state_runtime = runtime.clone();
                 let descriptor = descriptor.clone();
                 component_module.set(
@@ -7609,7 +7919,9 @@ impl ShellRuntime {
             // a `Callback` op because the name is discovered at run time and a
             // `Callback` holds a `&'static str`; see `SpecOp::ActionCallback`.
             "on_action" => {
-                if scope::current_phase() == Some(ScopePhase::Layout) {
+                if scope::current_phase() == Some(ScopePhase::Layout)
+                    && !self.interactive_inline_layout.get()
+                {
                     return Err(Exception::throw_type(
                         ctx,
                         "`on_action` cannot be registered from a virtual list's item \
@@ -7650,7 +7962,9 @@ impl ShellRuntime {
             // fixed names GPUI's own `MouseButton` maps onto — so the op stays
             // the `(&'static str, CallbackId)` pair every other callback uses.
             "on_mouse_down" | "on_mouse_up" => {
-                if scope::current_phase() == Some(ScopePhase::Layout) {
+                if scope::current_phase() == Some(ScopePhase::Layout)
+                    && !self.interactive_inline_layout.get()
+                {
                     return Err(Exception::throw_type(
                         ctx,
                         &format!(
@@ -7707,6 +8021,8 @@ impl ShellRuntime {
             | "on_link_click"
             | "on_resize"
             | "on_change"
+            | "token"
+            | "on_token_click"
             | "on_open_change"
             | "on_confirm"
             | "on_dismiss"
@@ -7723,9 +8039,7 @@ impl ShellRuntime {
             | "tab_bar"
             | "empty_group"
             | "drop_indicator"
-            | "dock"
-            | "tile_drag_bar"
-            | "tile_resize_handles" => {
+            | "dock" => {
                 // A handler registered from inside a virtual list's item
                 // renderer has nowhere to live. Callbacks belong to the
                 // snapshot that registered them and are retired with it; the
@@ -7736,7 +8050,9 @@ impl ShellRuntime {
                 // leaked quietly. `on_item_click` on the list is the one
                 // handler that covers the rows, and it is registered from
                 // `render()` like every other.
-                if scope::current_phase() == Some(ScopePhase::Layout) {
+                if scope::current_phase() == Some(ScopePhase::Layout)
+                    && !self.interactive_inline_layout.get()
+                {
                     return Err(Exception::throw_type(
                         ctx,
                         &format!(
@@ -7997,10 +8313,7 @@ impl ShellRuntime {
                     let Some(target) = bridged.first().and_then(|value| value.as_str().ok()) else {
                         return Err(Exception::throw_type(ctx, "href(url) expects a string"));
                     };
-                    let valid = reqwest::Url::parse(target).is_ok_and(|url| {
-                        matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
-                    });
-                    if !valid {
+                    if !is_openable_url(target) {
                         return Err(Exception::throw_type(
                             ctx,
                             "href(url) expects an absolute HTTP(S) URL with a host",
@@ -8015,8 +8328,7 @@ impl ShellRuntime {
             // as the dock is on screen, so a callback registered inside one
             // would pile up the way a virtual list's row handlers would.
             "select_tab" | "close_panel" | "toggle_zoom" | "drag_tab" | "drop_tab"
-            | "toggle_dock" | "resize_dock" | "move_tile" | "resize_tile" | "raise_tile"
-            | "toggle_tile_zoom" | "close_tile" => {
+            | "toggle_dock" | "resize_dock" => {
                 let bridged = args.values(method)?;
                 let name = match method {
                     "select_tab" => "select_tab",
@@ -8025,12 +8337,7 @@ impl ShellRuntime {
                     "drag_tab" => "drag_tab",
                     "drop_tab" => "drop_tab",
                     "toggle_dock" => "toggle_dock",
-                    "resize_dock" => "resize_dock",
-                    "move_tile" => "move_tile",
-                    "resize_tile" => "resize_tile",
-                    "raise_tile" => "raise_tile",
-                    "toggle_tile_zoom" => "toggle_tile_zoom",
-                    _ => "close_tile",
+                    _ => "resize_dock",
                 };
                 if !bridged
                     .first()
@@ -8040,7 +8347,7 @@ impl ShellRuntime {
                     return Err(Exception::throw_type(
                         ctx,
                         &format!(
-                            "{name}(...) expects the group, dock or tile its chrome handler was                              given as its first argument"
+                            "{name}(...) expects the group or dock its chrome handler was given as its first argument"
                         ),
                     ));
                 }
@@ -9308,6 +9615,47 @@ enum Argument {
     Slot(u16),
 }
 
+enum EventArguments<'a> {
+    Scalar(&'a [ComponentCallbackArgument]),
+    Data(&'a [ComponentDataValue]),
+}
+impl EventArguments<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Scalar(values) => values.len(),
+            Self::Data(values) => values.len(),
+        }
+    }
+}
+
+struct PlainDataArguments(Vec<ComponentDataValue>);
+impl<'js> FromJs<'js> for PlainDataArguments {
+    fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> JsResult<Self> {
+        match component_data_from_js(ctx, value, 0, &mut ComponentDataBudget::default())? {
+            ComponentDataValue::Array(values) => Ok(Self(values)),
+            _ => Err(Exception::throw_type(
+                ctx,
+                "state operation expects an argument array",
+            )),
+        }
+    }
+}
+struct DataResult(ComponentDataValue);
+impl<'js> rquickjs::IntoJs<'js> for DataResult {
+    fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
+        component_data_into_js(ctx, &self.0)
+    }
+}
+fn state_operation_error(ctx: &Ctx<'_>, error: anyhow::Error) -> rquickjs::Error {
+    if let Some(token) = error.downcast_ref::<gpui_base::input::InlineTokenError>() {
+        if let Ok(exception) = Exception::from_message(ctx.clone(), &token.to_string()) {
+            let _ = exception.as_object().set("code", format!("{token:?}"));
+            return exception.throw();
+        }
+    }
+    Exception::throw_type(ctx, &error.to_string())
+}
+
 struct Arguments(SmallVec<[Argument; 2]>);
 
 /// The single argument of a parametric style method.
@@ -9620,9 +9968,9 @@ fn callback_op_name(method: &str) -> Option<&'static str> {
         "empty_group" => "empty_group",
         "drop_indicator" => "drop_indicator",
         "dock" => "dock",
-        "tile_drag_bar" => "tile_drag_bar",
-        "tile_resize_handles" => "tile_resize_handles",
         "on_change" => "on_change",
+        "token" => "token",
+        "on_token_click" => "on_token_click",
         "on_confirm" => "on_confirm",
         "on_dismiss" => "on_dismiss",
         "on_step" => "on_step",
@@ -11181,6 +11529,14 @@ export default class BrokenChild extends View {
 
 #[cfg(test)]
 mod reserved_element_method_tests {
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_runtimes_stay_on_the_interpreter_tier() {
+        let config = super::shell_jit_config().expect("JIT configuration");
+        assert_eq!(config.call_threshold(), u32::MAX);
+        assert_eq!(config.loop_threshold(), u32::MAX);
+    }
+
     /// `typings.rs` withholds these from a registered component that does not
     /// declare them. If the engine started accepting a fourth, the declarations
     /// would keep offering it on every component and the call would throw.
